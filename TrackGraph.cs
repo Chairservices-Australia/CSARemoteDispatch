@@ -69,12 +69,17 @@ namespace DvMod.RemoteDispatch
             {
                 if (candidate == null || candidate.track == null || candidate.track == step.track)
                     continue;
-                // candidate.first tells us which end of the next track meets this
-                // junction; entering by that end means entering "via in" when the
-                // next track's own inBranch is the one that matched.
-                var enteredViaIn = candidate.track.inBranch != null
-                    && candidate.track.inBranch.first == candidate.first
-                    && candidate.track.inJunction == junction;
+                // Which end of the next track meets this junction decides the
+                // direction we travel along it. Junction identity is the reliable
+                // test; the branch's `first` flag describes the bezier endpoint,
+                // not which of the track's two junctions we came through.
+                bool enteredViaIn;
+                if (candidate.track.inJunction == junction)
+                    enteredViaIn = true;
+                else if (candidate.track.outJunction == junction)
+                    enteredViaIn = false;
+                else
+                    continue;
                 yield return new Step(candidate.track, enteredViaIn);
             }
         }
@@ -143,6 +148,26 @@ namespace DvMod.RemoteDispatch
                 }
             }
             return null;
+        }
+
+        /// How many distinct track/direction states are reachable from a step.
+        /// A tiny number means graph traversal is broken rather than the
+        /// destination being genuinely unreachable, which is the useful thing to
+        /// know when a route fails.
+        public static int CountReachable(Step start, int limit = 20000)
+        {
+            var seen = new HashSet<Step> { start };
+            var queue = new Queue<Step>();
+            queue.Enqueue(start);
+            while (queue.Count > 0 && seen.Count < limit)
+            {
+                foreach (var next in Successors(queue.Dequeue()))
+                {
+                    if (seen.Add(next))
+                        queue.Enqueue(next);
+                }
+            }
+            return seen.Count;
         }
 
         private static List<Step> Reconstruct(Dictionary<Step, Step> cameFrom, Step start, Step goal)

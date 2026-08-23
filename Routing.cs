@@ -27,6 +27,7 @@ namespace DvMod.RemoteDispatch
         public List<JunctionSetting> settings = new List<JunctionSetting>();
         public List<string> trackIds = new List<string>();
         public readonly HashSet<Junction> pending = new HashSet<Junction>();
+        public bool requiresReverse;
     }
 
     /// Route planning and safe junction setting.
@@ -168,18 +169,33 @@ namespace DvMod.RemoteDispatch
 
             route.priority = PriorityFor(start.Value.track);
 
-            var path = TrackGraph.FindPath(
-                start.Value,
-                new HashSet<RailTrack> { destination },
-                extraCost: RightHandPenalty);
+            // Search the way the train faces first. If nothing is reachable that
+            // way the train can still reverse, so try the opposite direction
+            // rather than reporting no route at all.
+            var goals = new HashSet<RailTrack> { destination };
+            var path = TrackGraph.FindPath(start.Value, goals, extraCost: RightHandPenalty);
+            var reversed = false;
+            if (path == null)
+            {
+                var behind = new TrackGraph.Step(start.Value.track, !start.Value.enteredViaIn);
+                path = TrackGraph.FindPath(behind, goals, extraCost: RightHandPenalty);
+                reversed = path != null;
+            }
 
             if (path == null)
             {
                 route.status = RouteStatus.Failed;
-                route.message = "No route found to that track.";
+                var forwardReach = TrackGraph.CountReachable(start.Value);
+                var backwardReach = TrackGraph.CountReachable(
+                    new TrackGraph.Step(start.Value.track, !start.Value.enteredViaIn));
+                route.message = "No route found to " + DescribeTrack(destination)
+                    + " from " + DescribeTrack(start.Value.track)
+                    + " (reachable states: " + forwardReach + " ahead, "
+                    + backwardReach + " behind).";
                 routes[route.id] = route;
                 return route;
             }
+            route.requiresReverse = reversed;
 
             route.trackIds = path
                 .Select(step => step.track.LogicTrack())
@@ -283,9 +299,10 @@ namespace DvMod.RemoteDispatch
         private static void UpdateStatus(TrainRoute route)
         {
             route.status = route.pending.Count > 0 ? RouteStatus.Pending : RouteStatus.Active;
+            var prefix = route.requiresReverse ? "Route set (train must reverse). " : "";
             route.message = route.pending.Count > 0
-                ? "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
-                : "Route set.";
+                ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
+                : (route.requiresReverse ? "Route set - train must reverse to follow it." : "Route set.");
         }
 
         /// Retry deferred junctions. Driven by Updater so it shares the mod's
@@ -348,6 +365,12 @@ namespace DvMod.RemoteDispatch
             return new TrackGraph.Step(bogie.track, enteredViaIn);
         }
 
+        private static string DescribeTrack(RailTrack track)
+        {
+            var logicTrack = track == null ? null : track.LogicTrack();
+            return logicTrack == null ? "an unnamed track" : logicTrack.ID.FullDisplayID;
+        }
+
         public static JObject ToJson(TrainRoute route) => new JObject(
             new JProperty("id", route.id),
             new JProperty("trainsetId", route.trainsetId),
@@ -356,6 +379,7 @@ namespace DvMod.RemoteDispatch
             new JProperty("message", route.message),
             new JProperty("priority", route.priority),
             new JProperty("pendingJunctions", route.pending.Count),
+            new JProperty("requiresReverse", route.requiresReverse),
             new JProperty("tracks", new JArray(route.trackIds)));
 
         public static string AllRoutesJson() =>

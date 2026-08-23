@@ -658,9 +658,16 @@ function updateRouteTrainList() {
   fillSelect(routeTrainSelect, entries, true);
 }
 
+// Tracks are labelled with the game's display ID ("GF-D5I"), matching what jobs
+// and lineside signage show, while the canonical ID stays as the value.
 function updateRouteTrackList() {
   const tracks = stationTracks.get(routeStationSelect.value) || [];
-  fillSelect(routeTrackSelect, tracks.map(trackId => [trackId, trackId]), true);
+  const entries = tracks
+    .map(track => typeof track === 'string'
+      ? [track, track]
+      : [track.id, track.display || track.id])
+    .sort((a, b) => a[1].localeCompare(b[1]));
+  fillSelect(routeTrackSelect, entries, true);
 }
 
 routeStationSelect.addEventListener('input', updateRouteTrackList);

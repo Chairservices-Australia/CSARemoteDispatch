@@ -75,8 +75,12 @@ namespace DvMod.RemoteDispatch
             return new World.Position((float)(x / count), (float)(z / count));
         }
 
-        /// Track IDs belonging to this station, for destination selection.
-        private static IEnumerable<string> TrackIdsOf(StationController station)
+        /// Tracks belonging to this station, for destination selection.
+        /// Carries both IDs: FullID is canonical and used for lookup, while
+        /// FullDisplayID is the shorter form the game shows on jobs and signage
+        /// ("GF-D5I" rather than "GF-D-05-I"), so the UI can match what the
+        /// player sees.
+        private static IEnumerable<JObject> TrackIdsOf(StationController station)
         {
             var tracks = station.AllStationTracks;
             if (tracks == null)
@@ -84,8 +88,11 @@ namespace DvMod.RemoteDispatch
             foreach (var track in tracks)
             {
                 var logicTrack = track == null ? null : track.LogicTrack();
-                if (logicTrack != null)
-                    yield return logicTrack.ID.FullID;
+                if (logicTrack == null)
+                    continue;
+                yield return new JObject(
+                    new JProperty("id", logicTrack.ID.FullID),
+                    new JProperty("display", logicTrack.ID.FullDisplayID));
             }
         }
     }

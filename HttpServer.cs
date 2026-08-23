@@ -254,12 +254,16 @@ namespace DvMod.RemoteDispatch
             RenderEmpty(context, 404);
         }
 
+        /// Accepts either form of track ID: the canonical "GF-D-05-I" or the
+        /// shorter "GF-D5I" the game prints on jobs and signage.
         private static RailTrack? FindRailTrackById(string trackId)
         {
             foreach (var track in Component.FindObjectsOfType<RailTrack>())
             {
                 var logicTrack = track == null ? null : track.LogicTrack();
-                if (logicTrack != null && logicTrack.ID.FullID == trackId)
+                if (logicTrack == null)
+                    continue;
+                if (logicTrack.ID.FullID == trackId || logicTrack.ID.FullDisplayID == trackId)
                     return track;
             }
             return null;
