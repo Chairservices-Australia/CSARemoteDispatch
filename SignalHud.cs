@@ -83,10 +83,20 @@ namespace DvMod.RemoteDispatch
 
             var signalWidth = LampSize + 12f;
             var signalHeight = LampSize * 3 + 24f;
-            var signalX = Screen.width - MarginX - signalWidth;
             var signalY = MarginY;
 
-            var signX = signalX - Gap - SignSize;
+            // Lay out the instruction panel first, then centre the speed board
+            // and signal head over it as one group. On narrow screens this moves
+            // both signs left instead of leaving the text visually detached or
+            // allowing its right edge to clip.
+            var statusRight = Screen.width - MarginX;
+            var statusWidth = Mathf.Min(StatusWidth,
+                Mathf.Max(0f, Screen.width - MarginX - StatusEdgeMargin));
+            var statusX = statusRight - statusWidth;
+            var groupWidth = SignSize + Gap + signalWidth;
+            var groupCenter = statusX + statusWidth / 2f;
+            var signX = groupCenter - groupWidth / 2f;
+            var signalX = signX + SignSize + Gap;
             var signY = MarginY;
 
             DrawSpeedSign(new Rect(signX, signY, SignSize, SignSize), reading.speedLimitKph);
@@ -95,9 +105,7 @@ namespace DvMod.RemoteDispatch
             // Anchor the instruction panel to the same safe right margin as the
             // signal. The old centred box extended beyond the screen edge and
             // clipped longer text.
-            var statusRight = Screen.width - MarginX;
-            var statusWidth = Mathf.Min(StatusWidth, statusRight - StatusEdgeMargin);
-            var statusRect = new Rect(statusRight - statusWidth,
+            var statusRect = new Rect(statusX,
                 signalY + signalHeight + 8f, statusWidth, 78f);
             if (reading.passToCouple)
             {
