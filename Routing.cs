@@ -46,6 +46,8 @@ namespace DvMod.RemoteDispatch
         public float offRouteSince;
         public float wrongWaySince;
         public string notice = "";   // survives status updates
+        public float nextObstructionRerouteTime;
+        public string obstructedTrackId = "";
 
         // A road that changes direction partway. The train runs out along the
         // first leg, stands clear, then draws back over the same junction onto
@@ -358,7 +360,9 @@ namespace DvMod.RemoteDispatch
         }
 
         /// Plan and apply a route for a trainset to a destination track.
-        public static TrainRoute SetRoute(Trainset trainset, RailTrack destination, string destinationTrackId)
+        public static TrainRoute SetRoute(
+            Trainset trainset, RailTrack destination, string destinationTrackId,
+            bool allowReversal = true)
         {
             var sequence = nextRouteId++;
             var route = new TrainRoute
@@ -440,8 +444,9 @@ namespace DvMod.RemoteDispatch
             // Where no single-direction road exists - or where one exists but
             // is far enough round to be worse than stopping and changing ends -
             // look for a road that runs out and sets back.
-            var reversal = PlanReversal(
-                candidates, goals, ConsistLength(trainset), IsBlocked);
+            var reversal = allowReversal
+                ? PlanReversal(candidates, goals, ConsistLength(trainset), IsBlocked)
+                : null;
             var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
 
             if (path == null && !useReversal)
@@ -1219,6 +1224,100 @@ namespace DvMod.RemoteDispatch
                 replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
         }
 
+        /// How far along the booked road to watch for newly loaded consists.
+        /// Two kilometres gives multiplayer enough time to stream cars and lets
+        /// a train receive a new road well before reaching the protecting signal.
+        private const float ObstructionLookaheadMeters = 2000f;
+        private const float ObstructionRetrySeconds = 10f;
+
+        private static RailTrack? ObstructedTrackAhead(TrainRoute route)
+        {
+            var occupied = new HashSet<RailTrack>();
+            var powered = new HashSet<RailTrack>();
+            Occupancy.OccupiedTracksByOthers(route.trainsetId, occupied, powered);
+
+            var distance = 0f;
+            for (var i = Mathf.Max(0, route.progressIndex + 1);
+                i < route.pathTracks.Count && distance <= ObstructionLookaheadMeters; i++)
+            {
+                var track = route.pathTracks[i];
+                distance += TrackGraph.TrackLength(track);
+                if (!occupied.Contains(track))
+                    continue;
+
+                // Loose cars on the selected destination are an intentional
+                // coupling target. Any through-track occupancy, or a powered
+                // train at the destination, is an obstruction.
+                var isDestination = i == route.pathTracks.Count - 1;
+                if (isDestination && !powered.Contains(track))
+                    continue;
+                return track;
+            }
+            return null;
+        }
+
+        /// Replan around live occupancy. Returns true while the old route should
+        /// stop processing this tick (either replaced or held at red).
+        private static bool HandleLiveObstruction(TrainRoute route)
+        {
+            var obstruction = ObstructedTrackAhead(route);
+            if (obstruction == null)
+            {
+                route.obstructedTrackId = "";
+                route.nextObstructionRerouteTime = 0f;
+                return false;
+            }
+
+            var obstructionId = DescribeTrack(obstruction);
+            if (route.obstructedTrackId != obstructionId)
+            {
+                route.obstructedTrackId = obstructionId;
+                route.nextObstructionRerouteTime = 0f;
+            }
+
+            // Drop the signal reservation immediately. Until a replacement is
+            // proven clear, DV Signals must protect the train with a red aspect.
+            ReleaseAllocation(route);
+            route.waitingForSignal = true;
+            route.status = RouteStatus.Pending;
+            route.message = "Obstruction ahead on " + obstructionId
+                + "; protecting signal held at red while looking for a clear route.";
+
+            if (Time.time < route.nextObstructionRerouteTime)
+                return true;
+            route.nextObstructionRerouteTime = Time.time + ObstructionRetrySeconds;
+
+            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var destination = FindTrack(route.destinationTrackId);
+            if (trainset == null || destination == null)
+                return true;
+
+            // Remove the old route from conflict consideration while testing a
+            // replacement. If no alternative exists it is restored below and
+            // remains held at red rather than disappearing from the UI.
+            routes.Remove(route.id);
+            // A live diversion must remain a through movement. Running an
+            // expensive reversal search every retry would hitch the host and
+            // could instruct a moving train to change ends unexpectedly.
+            var replacement = SetRoute(
+                trainset, destination, route.destinationTrackId, allowReversal: false);
+            if (replacement.status != RouteStatus.Failed)
+            {
+                replacement.rerouteCount = route.rerouteCount + 1;
+                replacement.requestedBy = route.requestedBy;
+                replacement.notice = "Rerouted around occupied " + obstructionId + ". ";
+                UpdateStatus(replacement);
+                Sessions.AddTag("routes");
+                return true;
+            }
+
+            ReleaseAllocation(replacement);
+            routes.Remove(replacement.id);
+            routes[route.id] = route;
+            Sessions.AddTag("routes");
+            return true;
+        }
+
         /// The settings still to be applied, one per junction.
         ///
         /// A road that passes through the same junction twice - which propelling
@@ -1339,6 +1438,8 @@ namespace DvMod.RemoteDispatch
                 foreach (var route in routes.Values.ToList())
                 {
                     if (route.status == RouteStatus.Failed || route.status == RouteStatus.Cleared)
+                        continue;
+                    if (HandleLiveObstruction(route))
                         continue;
                     if (!route.allocationApplied)
                     {

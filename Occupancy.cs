@@ -28,6 +28,7 @@ namespace DvMod.RemoteDispatch
             new Dictionary<RailTrack, HashSet<TrainCar>>();
         private static readonly Dictionary<Vector2Int, List<CarPosition>> carGrid =
             new Dictionary<Vector2Int, List<CarPosition>>();
+        private static readonly HashSet<int> poweredTrainsets = new HashSet<int>();
 
         // Rebuilding happens often enough that dropping its collections each
         // time is itself a cost; they are recycled rather than reallocated.
@@ -56,6 +57,7 @@ namespace DvMod.RemoteDispatch
         public static void Reset()
         {
             Recycle();
+            poweredTrainsets.Clear();
             carSetPool.Clear();
             positionListPool.Clear();
             indexFrame = -1;
@@ -186,23 +188,18 @@ namespace DvMod.RemoteDispatch
         {
             occupied.Clear();
             powered.Clear();
-            var positions = new List<CarPosition>();
-            var poweredTrainsets = new HashSet<int>();
-            foreach (var position in AllCarPositions())
+            EnsureIndex(DisplayMaxAgeSeconds);
+            foreach (var pair in carsByTrack)
             {
-                var trainset = position.car.trainset;
-                if (trainset != null && trainset.id == ownTrainsetId)
-                    continue;
-                positions.Add(position);
-                occupied.Add(position.track);
-                if (position.car.IsLoco && trainset != null)
-                    poweredTrainsets.Add(trainset.id);
-            }
-            foreach (var position in positions)
-            {
-                var trainset = position.car.trainset;
-                if (trainset != null && poweredTrainsets.Contains(trainset.id))
-                    powered.Add(position.track);
+                foreach (var car in pair.Value)
+                {
+                    var trainset = car.trainset;
+                    if (trainset != null && trainset.id == ownTrainsetId)
+                        continue;
+                    occupied.Add(pair.Key);
+                    if (trainset != null && poweredTrainsets.Contains(trainset.id))
+                        powered.Add(pair.Key);
+                }
             }
         }
 
@@ -254,6 +251,7 @@ namespace DvMod.RemoteDispatch
             indexFrame = Time.frameCount;
             indexTime = Time.time;
             Recycle();
+            poweredTrainsets.Clear();
 
             var sets = Trainset.allSets;
             if (sets == null)
@@ -269,6 +267,8 @@ namespace DvMod.RemoteDispatch
                 {
                     if (car == null || car.Bogies == null)
                         continue;
+                    if (car.IsLoco)
+                        poweredTrainsets.Add(set.id);
                     foreach (var bogie in car.Bogies)
                     {
                         if (bogie == null || bogie.track == null || bogie.traveller == null)
