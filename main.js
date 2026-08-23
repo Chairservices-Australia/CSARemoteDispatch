@@ -675,6 +675,8 @@ const maxStops = 12;   // matches RouteDestination.MaxStops on the host
 let plannedStops = [];
 
 function stopLabelFor(id) {
+  if (!id)
+    return '';
   const planned = plannedStops.find(stop => stop.id === id);
   if (planned)
     return planned.label;

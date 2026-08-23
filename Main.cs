@@ -124,6 +124,7 @@ namespace DvMod.RemoteDispatch
             SpeedSigns.Reset();
             Signalling.Reset();
             Occupancy.Reset();
+            JobData.Reset();
             Stations.ResetCache();
             RailTracks.ResetCache();
         }

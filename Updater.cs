@@ -47,8 +47,8 @@ namespace DvMod.RemoteDispatch
 
         /// Run work that has to happen on the game thread but is too big for one
         /// frame, letting it yield between slices. Must be called from the game
-        /// thread. Returns false when the mod is shutting down and there is
-        /// nothing left to run it on.
+        /// thread. Returns false when there is nothing to run it on - before the
+        /// mod has finished starting, or after it has been shut down.
         public static bool RunSliced(IEnumerator routine)
         {
             if (instance == null)

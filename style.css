@@ -626,3 +626,9 @@ body.theme-dark .followControl a.followControlButton.active svg {
   font-weight: bold;
   margin-bottom: 2px;
 }
+
+/* Sits between the aboard-a-train line and the form, and collapses to nothing
+   while there is no job to offer. */
+#routeJobActions:not(:empty) {
+  margin: 0 0 6px;
+}

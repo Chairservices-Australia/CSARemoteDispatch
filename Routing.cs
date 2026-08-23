@@ -19,6 +19,20 @@ namespace DvMod.RemoteDispatch
 
     public enum RouteStatus { Active, Pending, Conflict, Failed, Cleared, AwaitingReversal }
 
+    /// A crossing claimed by a train on approach: how near it stood when last
+    /// measured, and when that was.
+    public readonly struct ApproachLock
+    {
+        public readonly float distance;
+        public readonly float since;
+
+        public ApproachLock(float distance, float since)
+        {
+            this.distance = distance;
+            this.since = since;
+        }
+    }
+
     public class TrainRoute
     {
         public string id = "";
@@ -84,13 +98,20 @@ namespace DvMod.RemoteDispatch
         /// apart in what the train is shown.
         public bool heldForApproach;
 
-        /// Crossings this road has come close enough to claim outright.
+        /// Crossings this road has come close enough to claim outright, each
+        /// with how near its train stood when last measured and when.
         ///
         /// A locked junction is not taken by a nearer train: once a train is
         /// committed to a crossing the road in front of it does not change
         /// under it, and two trains cannot trade the crossing back and forth as
         /// their distances cross. The lock is given back as the train passes.
-        public readonly HashSet<Junction> approachLocked = new HashSet<Junction>();
+        ///
+        /// Kept per crossing rather than per road, because a road can hold more
+        /// than one: sharing a single measurement between them let each reset
+        /// the other's clock, so the check for a train that has stopped closing
+        /// could never fire and a parked train held its crossings for ever.
+        public readonly Dictionary<Junction, ApproachLock> approachLocked =
+            new Dictionary<Junction, ApproachLock>();
 
         /// The contested crossing this road is waiting to approach, if any, with
         /// the distance and the time it began waiting. Only ever one, because
@@ -98,12 +119,6 @@ namespace DvMod.RemoteDispatch
         public Junction? approachHeld;
         public float approachHeldSince;
         public float approachHeldDistance;
-
-        /// How near this road's train last stood to a crossing it has locked,
-        /// and when. A train that stops closing on one it has claimed gives it
-        /// back rather than holding it against everyone for ever.
-        public float lockedDistance = float.PositiveInfinity;
-        public float lockedSince;
 
         /// Forget the leg just travelled, keeping the road's identity and the
         /// stops it has yet to call at, so the next leg is planned into this
@@ -144,7 +159,6 @@ namespace DvMod.RemoteDispatch
             allocatedUpTo = int.MaxValue;
             heldShortOf = "";
             heldForApproach = false;
-            lockedDistance = float.PositiveInfinity;
         }
 
         /// The player whose request laid this road, in a session. Empty in
@@ -1223,7 +1237,7 @@ namespace DvMod.RemoteDispatch
         private static bool TryTakeJunction(
             TrainRoute route, JunctionSetting setting, TrainRoute owner, JunctionSetting ownerSetting)
         {
-            if (owner.approachLocked.Contains(setting.junction)
+            if (owner.approachLocked.ContainsKey(setting.junction)
                 && !LockHasGoneStale(owner, ownerSetting))
                 return false;
 
@@ -1255,18 +1269,19 @@ namespace DvMod.RemoteDispatch
         /// definition is not running its own arbitration while it sits still.
         private static bool LockHasGoneStale(TrainRoute owner, JunctionSetting ownerSetting)
         {
+            if (!owner.approachLocked.TryGetValue(ownerSetting.junction, out var held))
+                return false;
             var distance = DistanceToJunction(owner, ownerSetting);
-            if (float.IsPositiveInfinity(owner.lockedDistance)
-                || distance + JunctionPriorityHysteresisMeters < owner.lockedDistance)
+            if (distance + JunctionPriorityHysteresisMeters < held.distance)
             {
-                owner.lockedDistance = distance;
-                owner.lockedSince = Time.time;
+                // Still closing on it, so it is still going somewhere.
+                owner.approachLocked[ownerSetting.junction] =
+                    new ApproachLock(distance, Time.time);
                 return false;
             }
-            if (Time.time - owner.lockedSince < ApproachLockStaleSeconds)
+            if (Time.time - held.since < ApproachLockStaleSeconds)
                 return false;
             owner.approachLocked.Remove(ownerSetting.junction);
-            owner.lockedDistance = float.PositiveInfinity;
             return true;
         }
 
@@ -1326,7 +1341,7 @@ namespace DvMod.RemoteDispatch
         /// can get no nearer until the crossing is set.
         private static bool ClaimApproach(TrainRoute route, JunctionSetting setting)
         {
-            if (route.approachLocked.Contains(setting.junction))
+            if (route.approachLocked.ContainsKey(setting.junction))
                 return true;
 
             var distance = DistanceToJunction(route, setting);
@@ -1355,7 +1370,7 @@ namespace DvMod.RemoteDispatch
                     return false;
             }
 
-            route.approachLocked.Add(setting.junction);
+            route.approachLocked[setting.junction] = new ApproachLock(distance, Time.time);
             route.approachHeld = null;
             return true;
         }
@@ -1555,13 +1570,13 @@ namespace DvMod.RemoteDispatch
                     if (reservations.TryGetValue(setting.junction, out var owner) && owner == route.id)
                         reservations.Remove(setting.junction);
                     route.pending.Remove(setting.junction);
-                    if (route.approachLocked.Remove(setting.junction))
-                        route.lockedDistance = float.PositiveInfinity;
+                    route.approachLocked.Remove(setting.junction);
                 }
                 route.releasedUpTo = rearmost;
             }
 
-            if (route.progressIndex >= route.pathTracks.Count - 1)
+            if (route.progressIndex >= route.pathTracks.Count - 1
+                && HasReachedDestination(route))
             {
                 if (AdvanceToNextStop(route))
                     return;
@@ -1572,6 +1587,50 @@ namespace DvMod.RemoteDispatch
             }
             if (moved)
                 Sessions.AddTag("routes");
+        }
+
+        /// How near a junction a train has to come for a call there to count as
+        /// made. Generous: a train this close is at the turnout for any purpose
+        /// a dispatcher has in mind.
+        public const float JunctionArrivalMeters = 50f;
+
+        /// Whether the train has actually got to the place the road was booked
+        /// to.
+        ///
+        /// Being on a named track is being there - it is the destination. A
+        /// junction is not: it is a point, and the road to one ends on the track
+        /// that meets it, which may run for a mile before it gets there. Without
+        /// this the train was told it had arrived the moment its last vehicle
+        /// rolled onto that track, which on a long approach is nowhere near the
+        /// turnout that was asked for.
+        private static bool HasReachedDestination(TrainRoute route)
+        {
+            var junction = RouteDestination.FindJunction(route.destinationTrackId);
+            if (junction == null)
+                return true;
+            var cars = FindTrainset(route.trainsetId)?.cars;
+            if (cars == null)
+                return true;
+
+            // Any vehicle, not the leading one: a train that is propelling puts
+            // its far end at the junction first, and either way the consist has
+            // reached the turnout.
+            var position = junction.position;
+            foreach (var car in cars)
+            {
+                if (car == null || car.Bogies == null)
+                    continue;
+                foreach (var bogie in car.Bogies)
+                {
+                    if (bogie == null || bogie.traveller == null)
+                        continue;
+                    var p = bogie.traveller.worldPosition;
+                    var at = new Vector3((float)p.x, (float)p.y, (float)p.z);
+                    if (Vector3.Distance(at, position) <= JunctionArrivalMeters)
+                        return true;
+                }
+            }
+            return false;
         }
 
         /// Lay the next leg of a road that calls at more than one place.
@@ -1952,11 +2011,20 @@ namespace DvMod.RemoteDispatch
                         UpdateStatus(route);
                         continue;
                     }
+                    // What the road asks of each junction ahead - not the first
+                    // setting in the list carrying that junction. A road that
+                    // passes one twice, as a run-round or a shunt does, holds two
+                    // settings for it wanting opposite branches, and the earlier
+                    // one is behind the train by the time the later one matters.
+                    // Taking the first threw the switch back under the train.
+                    var wanted = new Dictionary<Junction, JunctionSetting>();
+                    foreach (var setting in PendingSettings(route))
+                        wanted[setting.junction] = setting;
+
                     var stillPending = new List<Junction>();
                     foreach (var junction in route.pending)
                     {
-                        var setting = route.settings.FirstOrDefault(s => s.junction == junction);
-                        if (setting == null)
+                        if (!wanted.TryGetValue(junction, out var setting))
                             continue;
                         if (Occupancy.IsJunctionClear(junction))
                             junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);

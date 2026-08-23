@@ -147,6 +147,20 @@ namespace DvMod.RemoteDispatch
             return job;
         }
 
+        /// Drop the job index when the world goes. It is rebuilt wholesale from
+        /// the live registry, so letting go of it is always safe - and holding
+        /// jobs from a world that has been unloaded is not, now that a miss no
+        /// longer rebuilds unconditionally.
+        ///
+        /// The per-car index is deliberately left alone: it is filled as the
+        /// game assigns cars to jobs, not from a sweep, so clearing it would
+        /// lose entries nothing would put back.
+        public static void Reset()
+        {
+            jobForId = new Dictionary<string, Job>();
+            lastJobIndexBuild = float.NegativeInfinity;
+        }
+
         private static void RebuildJobIndex()
         {
             lastJobIndexBuild = Time.time;

@@ -102,7 +102,7 @@ namespace DvMod.RemoteDispatch
             if (!Updater.RunSliced(GenerateTrackPointCoroutine(completion)))
             {
                 generation = null;
-                completion.SetException(new Exception("The mod is shutting down."));
+                completion.SetException(new Exception("The mod is not running."));
             }
             return completion.Task;
         }
