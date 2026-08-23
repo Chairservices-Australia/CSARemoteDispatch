@@ -8,5 +8,6 @@
   "Requirements": [ "DVSignals" ],
   "LoadAfter": [ "DVSignals", "PersistentJobsMod" ],
   "ManagerVersion": "0.27.3",
-  "HomePage": "https://github.com/Chairservices-Australia/CSARemoteDispatch"
+  "HomePage": "https://github.com/Chairservices-Australia/CSARemoteDispatch",
+  "Repository": "https://raw.githubusercontent.com/Chairservices-Australia/CSARemoteDispatch/main/repository.json"
 }
