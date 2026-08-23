@@ -88,29 +88,37 @@ namespace DvMod.RemoteDispatch
         }
 
         /// A point on a branch a little way out from the junction it leaves.
+        ///
+        /// Walks the bezier curve rather than the sampled point set: curve points
+        /// are transform positions, the same frame as Junction.position, while
+        /// GetKinkedPointSet returns coordinates that are not shifted by the
+        /// world mover. Subtracting one from the other leaves the mover offset in
+        /// the result, which is far larger than any track geometry and drowns the
+        /// answer entirely.
         private static Vector3 PointAlong(RailTrack track, bool fromInEnd, float distance)
         {
-            var pointSet = track == null ? null : track.GetKinkedPointSet();
-            var points = pointSet?.points;
-            if (points == null || points.Length == 0)
+            var curve = track == null ? null : track.curve;
+            if (curve == null || curve.pointCount == 0)
                 return track == null ? Vector3.zero : track.transform.position;
 
-            // Walk in from whichever end meets the junction.
-            var startIndex = fromInEnd ? 0 : points.Length - 1;
+            var startIndex = fromInEnd ? 0 : curve.pointCount - 1;
             var stepDir = fromInEnd ? 1 : -1;
-            var origin = points[startIndex].position;
+            var origin = curve[startIndex].position;
 
-            for (var i = startIndex; i >= 0 && i < points.Length; i += stepDir)
+            var travelled = 0f;
+            var previous = origin;
+            for (var i = startIndex + stepDir; i >= 0 && i < curve.pointCount; i += stepDir)
             {
-                var p = points[i].position;
-                var dx = p.x - origin.x;
-                var dz = p.z - origin.z;
-                if (dx * dx + dz * dz >= distance * distance)
-                    return new Vector3((float)p.x, 0f, (float)p.z);
+                var here = curve[i].position;
+                travelled += Vector3.Distance(previous, here);
+                previous = here;
+                if (travelled >= distance)
+                    return new Vector3(here.x, 0f, here.z);
             }
 
-            var last = points[fromInEnd ? points.Length - 1 : 0].position;
-            return new Vector3((float)last.x, 0f, (float)last.z);
+            // Shorter than the sample distance: its far end is the best answer.
+            var far = curve[fromInEnd ? curve.pointCount - 1 : 0].position;
+            return new Vector3(far.x, 0f, far.z);
         }
 
         /// Which side of the approach a branch lies on.

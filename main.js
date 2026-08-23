@@ -177,21 +177,36 @@ function pixelsPerMeter() {
   return Math.abs(oneMeterNorth.y - origin.y);
 }
 
-// Width multiplier for car overlays: true scale times the user's setting while
-// that stays legible, then clamped so cars keep a fixed on-screen size as the
-// map zooms out.
+// Cars are drawn end to end at their true length, so scaling length overlaps
+// each car onto its neighbour by exactly the amount scaled. The two reasons for
+// scaling are therefore kept apart:
 //
-// Only the width is inflated. Length is drawn true, because a car's position is
-// its centre: stretching the length pushes each car over its neighbours, so an
-// enlarged consist would overlap itself and hide the couplings between vehicles.
-function getCarWidthScale() {
-  const userScale = getCarScale();
+//   zoom clamp  - applies to length and width together, and only ever enlarges.
+//                 It exists so a consist stays visible when zoomed out, where
+//                 the whole train is a few pixels and overlap between its cars
+//                 cannot be seen anyway.
+//   user scale  - applies to width only, so cars can be made bolder at working
+//                 zoom without ever running into one another.
+function carZoomClamp() {
   const trueWidthPx = carWidthMeters * pixelsPerMeter();
   if (!isFinite(trueWidthPx) || trueWidthPx <= 0)
-    return userScale;
-  const targetWidthPx = Math.max(trueWidthPx * userScale, minCarWidthPx * userScale);
-  return targetWidthPx / trueWidthPx;
+    return 1;
+  return Math.max(1, minCarWidthPx / trueWidthPx);
 }
+
+function getCarLengthScale() {
+  return carZoomClamp();
+}
+
+function getCarWidthScale() {
+  // Capped against the shortest car so a wide setting cannot make a vehicle
+  // broader than it is long, which reads as a bar across the track.
+  return carZoomClamp() * Math.min(getCarScale(), maxCarWidthRatio * shortestCarLength / carWidthMeters);
+}
+
+// Widest a car may be drawn relative to its own length.
+const maxCarWidthRatio = 0.5;
+const shortestCarLength = 12;
 
 function refreshAllCarMarkers() {
   for (const carId of carMarkers.keys())
@@ -1290,7 +1305,7 @@ function updateCarMarker(carId) {
 
 function getCarOverlayBounds(carData) {
   const position = carData.position;
-  const length = metersToDegrees * carData.length;
+  const length = metersToDegrees * carData.length * getCarLengthScale();
   const width = metersToDegrees * carWidthMeters * getCarWidthScale();
   return [ [ position[0] - width/2, position[1] - length/2], [position[0] + width/2, position[1] + length/2] ];
 }
