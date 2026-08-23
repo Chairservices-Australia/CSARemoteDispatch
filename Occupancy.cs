@@ -151,12 +151,36 @@ namespace DvMod.RemoteDispatch
                     for (var i = 0; i < bucket.Count; i++)
                     {
                         var position = bucket[i];
+                        // Parallel and grade-separated tracks can pass inside
+                        // the world-space clearance circle without fouling this
+                        // turnout. Only bogies on rails which actually terminate
+                        // at the junction can make it unsafe to throw.
+                        if (!TrackConnectsToJunction(position.track, junction))
+                            continue;
                         if (Vector3.Distance(position.position, junctionPosition) <= JunctionClearanceMeters)
                             return false;
                     }
                 }
             }
             return true;
+        }
+
+        private static bool TrackConnectsToJunction(RailTrack track, Junction junction)
+        {
+            if (track == null)
+                return false;
+            if (junction.inBranch != null && junction.inBranch.track == track)
+                return true;
+            var branches = junction.outBranches;
+            if (branches == null)
+                return false;
+            for (var i = 0; i < branches.Count; i++)
+            {
+                var branch = branches[i];
+                if (branch != null && branch.track == track)
+                    return true;
+            }
+            return false;
         }
 
         /// Trainsets occupying any of the given tracks, excluding one.
