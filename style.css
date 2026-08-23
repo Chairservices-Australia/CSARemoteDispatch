@@ -457,15 +457,59 @@ input[type="range"] {
   box-shadow: 0 1px 4px var(--rd-shadow);
 }
 
-/* Follow controls -------------------------------------------------- */
+/* Follow controls -------------------------------------------------- *
+ * No width/height here on purpose: the zoom buttons are sized by
+ * `.leaflet-touch .leaflet-bar a` (36px) or Leaflet's 26px default, and these
+ * should match whichever applies rather than pinning a third size.
+ */
 .followControl a.followControlButton {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  text-align: center;
 }
-.followControl a.followControlButton.active {
+.followControl a.followControlButton.active,
+.followControl a.followControlButton.active svg,
+.followControl a.followControlButton.active i {
   background: var(--rd-accent);
+  color: var(--rd-accent-text);
+}
+
+/* Icon legibility ---------------------------------------------------- *
+ * Font Awesome swaps each <i> for an <svg> that paints with currentColor, and
+ * several Leaflet controls set their own dark colour. These rules are scoped to
+ * the theme class so they outrank the plugin defaults in both directions.
+ */
+body.theme-dark .leaflet-bar a,
+body.theme-dark .leaflet-bar a svg,
+body.theme-dark .leaflet-bar a i,
+body.theme-dark .leaflet-control-zoom a,
+body.theme-dark .gin-control-zoom a,
+body.theme-dark .gin-control-zoom a svg,
+body.theme-dark .followControl a.followControlButton,
+body.theme-dark .followControl a.followControlButton svg,
+body.theme-dark .leaflet-sidebar-tabs a,
+body.theme-dark .leaflet-sidebar-tabs a svg,
+body.theme-dark .leaflet-sidebar-tabs a i,
+body.theme-dark .locoControlButton,
+body.theme-dark .locoControlButton svg,
+body.theme-dark .locoControlButton i {
+  color: #ffffff;
+}
+
+body.theme-dark .leaflet-bar a svg path,
+body.theme-dark .gin-control-zoom a svg path,
+body.theme-dark .followControl a.followControlButton svg path,
+body.theme-dark .leaflet-sidebar-tabs a svg path,
+body.theme-dark .locoControlButton svg path {
+  fill: currentColor;
+}
+
+/* The active tab and active follow button invert instead, so their icon stays
+   readable against the accent fill. */
+body.theme-dark .leaflet-sidebar-tabs li.active a,
+body.theme-dark .leaflet-sidebar-tabs li.active a svg,
+body.theme-dark .followControl a.followControlButton.active,
+body.theme-dark .followControl a.followControlButton.active svg {
   color: var(--rd-accent-text);
 }
