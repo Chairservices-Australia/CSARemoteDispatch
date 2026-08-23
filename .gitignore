@@ -1,6 +1,7 @@
 /.vs/
 /bin/
 /obj/
+/release/
 /dv
 /.idea/
 Directory.Build.targets
