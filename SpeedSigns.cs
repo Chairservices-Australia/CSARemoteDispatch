@@ -45,7 +45,10 @@ namespace DvMod.RemoteDispatch
 
         private static readonly Dictionary<Vector3Int, Sign> known = new Dictionary<Vector3Int, Sign>();
         private static readonly Dictionary<int, TrainState> trainStates = new Dictionary<int, TrainState>();
+        private static readonly Dictionary<Vector2Int, List<RailTrack>> trackGrid =
+            new Dictionary<Vector2Int, List<RailTrack>>();
         private static float nextScanTime;
+        private static float nextTrackGridTime;
 
         public const float RescanSeconds = 5f;
 
@@ -55,7 +58,9 @@ namespace DvMod.RemoteDispatch
         {
             known.Clear();
             trainStates.Clear();
+            trackGrid.Clear();
             nextScanTime = 0f;
+            nextTrackGridTime = 0f;
         }
 
         public static void ScanIfDue()
@@ -68,7 +73,11 @@ namespace DvMod.RemoteDispatch
 
         public static void Scan()
         {
-            var tracks = Object.FindObjectsOfType<RailTrack>();
+            if (trackGrid.Count == 0 || Time.time >= nextTrackGridTime)
+            {
+                BuildTrackGrid(Object.FindObjectsOfType<RailTrack>());
+                nextTrackGridTime = Time.time + TrackGridRefreshSeconds;
+            }
             foreach (var data in Object.FindObjectsOfType<SignGeneratorData>())
             {
                 if (data == null || data.signParameters == null)
@@ -88,7 +97,8 @@ namespace DvMod.RemoteDispatch
                         Mathf.RoundToInt(position.z));
                     if (known.ContainsKey(key))
                         continue;
-                    if (!NearestTrack(position, transform.forward, tracks, out var track, out var trackPosition))
+                    if (!NearestTrack(position, transform.forward, NearbyTracks(position),
+                        out var track, out var trackPosition))
                         continue;
                     known[key] = new Sign(position, transform.forward, kph, track, trackPosition);
                 }
@@ -227,11 +237,55 @@ namespace DvMod.RemoteDispatch
         }
 
         private const float TrackAssignmentMeters = 6f;
+        private const float TrackGridCellMeters = 50f;
+        private const float TrackGridSampleMeters = 25f;
+        private const float TrackGridRefreshSeconds = 30f;
         private const float MinimumMovementMeters = 0.05f;
         private const float CrossingToleranceMeters = 0.1f;
         private const int CurveSamples = 32;
 
-        private static bool NearestTrack(Vector3 position, Vector3 signFacing, RailTrack[] tracks,
+        private static void BuildTrackGrid(IEnumerable<RailTrack> tracks)
+        {
+            trackGrid.Clear();
+            foreach (var track in tracks)
+            {
+                var curve = track == null ? null : track.curve;
+                if (curve == null || curve.pointCount < 2)
+                    continue;
+                var samples = Mathf.Max(1,
+                    Mathf.CeilToInt(TrackGraph.TrackLength(track!) / TrackGridSampleMeters));
+                var cells = new HashSet<Vector2Int>();
+                for (var i = 0; i <= samples; i++)
+                    cells.Add(GridCell(curve.GetPointAt((float)i / samples)));
+                foreach (var cell in cells)
+                {
+                    if (!trackGrid.TryGetValue(cell, out var bucket))
+                        trackGrid[cell] = bucket = new List<RailTrack>();
+                    bucket.Add(track!);
+                }
+            }
+        }
+
+        private static IEnumerable<RailTrack> NearbyTracks(Vector3 position)
+        {
+            var center = GridCell(position);
+            var seen = new HashSet<RailTrack>();
+            for (var x = center.x - 1; x <= center.x + 1; x++)
+            for (var y = center.y - 1; y <= center.y + 1; y++)
+            {
+                if (!trackGrid.TryGetValue(new Vector2Int(x, y), out var bucket))
+                    continue;
+                foreach (var track in bucket)
+                    if (track != null && seen.Add(track))
+                        yield return track;
+            }
+        }
+
+        private static Vector2Int GridCell(Vector3 position) => new Vector2Int(
+            Mathf.FloorToInt(position.x / TrackGridCellMeters),
+            Mathf.FloorToInt(position.z / TrackGridCellMeters));
+
+        private static bool NearestTrack(Vector3 position, Vector3 signFacing, IEnumerable<RailTrack> tracks,
             out RailTrack nearest, out float trackPosition)
         {
             nearest = null!;

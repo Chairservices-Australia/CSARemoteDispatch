@@ -120,6 +120,7 @@ namespace DvMod.RemoteDispatch
             Routing.ClearAll();
             SpeedSigns.Reset();
             Signalling.Reset();
+            RailTracks.ResetCache();
         }
 
         public static void DebugLog(TrainCar car, Func<string> message)
