@@ -217,13 +217,14 @@ namespace DvMod.RemoteDispatch
             if (signalBodyTexture != null)
                 GUI.DrawTexture(rect, signalBodyTexture);
 
-            // Green at the top, amber in the middle, red at the bottom. A
-            // preliminary caution flashes the amber lamp at one hertz.
+            // Green at the top, amber in the middle, red at the bottom. NSW
+            // preliminary caution is steady green with amber flashing at one
+            // hertz; flashing amber must never appear by itself.
             var amberLit = aspect == Aspect.Caution
                 || (aspect == Aspect.PreliminaryCaution && Mathf.FloorToInt(Time.time * 2f) % 2 == 0);
             var lit = new[]
             {
-                aspect == Aspect.Clear,
+                aspect == Aspect.Clear || aspect == Aspect.PreliminaryCaution,
                 amberLit,
                 aspect == Aspect.Stop,
             };

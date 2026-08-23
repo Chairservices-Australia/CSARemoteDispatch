@@ -14,7 +14,7 @@ namespace DvMod.RemoteDispatch
     public enum Aspect
     {
         Clear,              // green          - all three blocks clear
-        PreliminaryCaution, // flashing amber - stop aspect is two signals ahead
+        PreliminaryCaution, // steady green + flashing amber - stop is two signals ahead
         Caution,            // steady amber   - next signal is at stop
         Stop,               // red            - next protected block occupied
         Unknown,            // no line ahead to read (buffer stop, or not on track)
@@ -278,6 +278,41 @@ namespace DvMod.RemoteDispatch
                 pack.OldCombinedSignal = main;
                 pack.OldCombinedLeftJunctionSignal = main;
                 pack.OldCombinedRightJunctionSignal = main;
+
+                ConfigurePreliminaryCaution(main);
+            }
+
+            /// DVSignals' default three-head pack defines NEXT_RESTRICTED as a
+            /// flashing green. Rewire that in-memory aspect to the requested NSW
+            /// indication: green steady with amber flashing. This also gives the
+            /// coupling override a real combined aspect to select.
+            private static void ConfigurePreliminaryCaution(SignalControllerDefinition controller)
+            {
+                if (controller.Signals == null)
+                    return;
+                foreach (var signal in controller.Signals)
+                {
+                    if (signal == null || signal.Aspects == null)
+                        continue;
+                    var green = signal.Aspects
+                        .SelectMany(aspect => aspect?.OnLights ?? new SignalLightDefinition[0])
+                        .FirstOrDefault(light => light != null && IsGreen(light.Colour));
+                    var amber = signal.Aspects
+                        .SelectMany(aspect => aspect?.OnLights ?? new SignalLightDefinition[0])
+                        .FirstOrDefault(light => light != null && IsAmber(light.Colour));
+                    if (green == null || amber == null)
+                        continue;
+
+                    foreach (var aspect in signal.Aspects)
+                    {
+                        if (aspect == null || aspect.BlinkingLights == null
+                            || !aspect.BlinkingLights.Any(light =>
+                                light != null && IsGreen(light.Colour)))
+                            continue;
+                        aspect.OnLights = new[] { green };
+                        aspect.BlinkingLights = new[] { amber };
+                    }
+                }
             }
         }
 
