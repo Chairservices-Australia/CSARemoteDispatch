@@ -17,6 +17,9 @@ namespace DvMod.RemoteDispatch
         /// left road harder, or drop it to zero to route purely by distance.
         public float leftHandBias = 5000f;
 
+        /// In-game speed sign and signal overlay, top right.
+        public bool showSignalHud = true;
+
         public bool showUndiscoveredLocomotives = false;
         public bool enableLogging = false;
 
@@ -63,6 +66,7 @@ namespace DvMod.RemoteDispatch
                 CarUpdater.ForceCarRefresh();
             }
 
+            showSignalHud = GUILayout.Toggle(showSignalHud, "Show in-game speed sign and signal");
             enableLogging = GUILayout.Toggle(enableLogging, "Enable logging");
 
             GUILayout.EndVertical();

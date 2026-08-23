@@ -33,6 +33,8 @@
   <ItemGroup>
     <Reference Include="UnityEngine.CoreModule"/>
     <Reference Include="UnityEngine.IMGUIModule"/>
+    <Reference Include="UnityEngine.PhysicsModule"/>
+    <Reference Include="UnityEngine.TextRenderingModule"/>
     <PackageReference Include="UnityModManager" Version="0.27.2"/>
   </ItemGroup>
 

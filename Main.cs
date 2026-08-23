@@ -106,6 +106,7 @@ namespace DvMod.RemoteDispatch
         private static void Start()
         {
             HttpServer.Create();
+            SignalHud.Create();
             Updater.Create();
             CarUpdater.Start();
         }
@@ -115,6 +116,7 @@ namespace DvMod.RemoteDispatch
             CarUpdater.Stop();
             Updater.Destroy();
             HttpServer.Destroy();
+            SignalHud.Destroy();
         }
 
         public static void DebugLog(TrainCar car, Func<string> message)
