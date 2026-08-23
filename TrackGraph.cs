@@ -87,9 +87,9 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        /// `extraCost` adds a penalty to a transition, used to express left-hand
-        /// running. It is a cost rather than a hard rule, so an equal-length left
-        /// road always wins while a much shorter right-hand route stays reachable.
+        /// `extraCost` adds a penalty to a transition. Returning positive
+        /// infinity forbids it outright, which is how left-hand running is
+        /// enforced without the search silently pricing its way around the rule.
         public static List<Step>? FindPath(
             Step start,
             HashSet<RailTrack> goals,
@@ -138,9 +138,12 @@ namespace DvMod.RemoteDispatch
                 {
                     if (isBlocked != null && isBlocked(next))
                         continue;
-                    var transitionCost = TrackLength(next.track)
-                        + (extraCost == null ? 0f : extraCost(step, next));
-                    var newCost = costSoFar[step] + transitionCost;
+                    var penalty = extraCost == null ? 0f : extraCost(step, next);
+                    // An infinite penalty means the transition is forbidden
+                    // outright, which is how left-hand running is enforced.
+                    if (float.IsPositiveInfinity(penalty))
+                        continue;
+                    var newCost = costSoFar[step] + TrackLength(next.track) + penalty;
                     if (costSoFar.TryGetValue(next, out var existing) && newCost >= existing)
                         continue;
                     costSoFar[next] = newCost;

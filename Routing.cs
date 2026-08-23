@@ -31,11 +31,13 @@ namespace DvMod.RemoteDispatch
         public bool requiresReverse;
         public int leftDivergences;
         public int rightDivergences;
+        public JArray divergenceDetail = new JArray();
         public List<RailTrack> pathTracks = new List<RailTrack>();
         public int progressIndex;   // path entries before this are behind the train
         public int releasedUpTo;    // junctions handed back, never re-taken
         public int rerouteCount;
         public float offRouteSince;
+        public bool directionVerified;
     }
 
     /// Route planning and safe junction setting.
@@ -228,6 +230,26 @@ namespace DvMod.RemoteDispatch
                 }
             }
 
+            // Only if left-hand running makes the destination unreachable is the
+            // rule relaxed, so a road always exists even where the layout has no
+            // left-hand option through.
+            if (path == null)
+            {
+                foreach (var candidate in candidates)
+                {
+                    var found = TrackGraph.FindPath(candidate, goals);
+                    if (found == null)
+                        continue;
+                    if (path == null || PathLength(found) < PathLength(path))
+                    {
+                        path = found;
+                        chosen = candidate;
+                    }
+                }
+                if (path != null)
+                    route.message = "No left-hand road available; routed by shortest path. ";
+            }
+
             if (path == null)
             {
                 var reach = candidates.Select(c => TrackGraph.CountReachable(c)).ToList();
@@ -246,6 +268,13 @@ namespace DvMod.RemoteDispatch
             route.requiresReverse = !occupied.Contains(chosen.track) || IsPropelling(trainset, chosen);
 
             route.pathTracks = path.Select(step => step.track).ToList();
+            // FullDisplayID, matching both the /track keys the map draws with and
+            // the IDs the game prints on jobs.
+            route.trackIds = path
+                .Select(step => step.track.LogicTrack())
+                .Where(track => track != null)
+                .Select(track => track.ID.FullDisplayID)
+                .ToList();
             route.settings = SettingsForPath(path);
             CountDivergences(path, route);
 
@@ -267,29 +296,46 @@ namespace DvMod.RemoteDispatch
             return route;
         }
 
-        /// Left-hand running is expressed as a cost penalty in the search: a
-        /// right-hand branch costs extra, so an equal-length left road always
-        /// wins, while a much shorter right-hand route is still available.
-        /// Tunable from the mod settings.
-        public static float LeftTurnPenalty => Main.settings.leftHandBias;
-
-        /// Penalty applied when a transition diverges to the right at a facing
-        /// junction. Trailing moves are not penalised: the switch does not choose
-        /// the direction there, so there is no left or right to prefer.
+        /// Left-hand running, enforced rather than priced.
+        ///
+        /// At a facing junction where a left-hand branch exists, taking a
+        /// right-hand one is forbidden outright. A cost penalty could always be
+        /// out-argued by a long enough detour, which is why a large one still
+        /// produced right-hand turns; there is no weight at which "prefer" means
+        /// "always". Where every branch turns right the move is allowed, since
+        /// refusing it would only make the destination unreachable.
         private static float RightHandPenalty(TrackGraph.Step from, TrackGraph.Step to)
         {
-            var junction = from.ExitJunction;
-            if (junction == null || junction.inBranch == null)
-                return 0f;
-            var facing = junction.inBranch.track == from.track;
-            if (!facing || junction.outBranches == null || junction.outBranches.Count < 2)
+            if (!IsFacingChoice(from, out var junction))
                 return 0f;
 
-            // Arriving at the end of `from` that meets the junction, and leaving
-            // along `to` from the end that meets the same junction.
             var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
             var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
-            return IsLeftBranch(approach, outward) ? 0f : LeftTurnPenalty;
+            if (IsLeftBranch(approach, outward))
+                return 0f;
+
+            // A right-hand move is only permitted when nothing turns left here.
+            foreach (var branch in junction!.outBranches)
+            {
+                if (branch == null || branch.track == null || branch.track == to.track)
+                    continue;
+                var branchOut = TangentAtEnd(branch.track, atInEnd: branch.first, leaving: true);
+                if (IsLeftBranch(approach, branchOut))
+                    return float.PositiveInfinity;
+            }
+            return 0f;
+        }
+
+        /// True when the route arrives on the stem here and the switch actually
+        /// chooses between branches. Trailing moves have no left or right.
+        private static bool IsFacingChoice(TrackGraph.Step from, out Junction? junction)
+        {
+            junction = from.ExitJunction;
+            if (junction == null || junction.inBranch == null)
+                return false;
+            if (junction.inBranch.track != from.track)
+                return false;
+            return junction.outBranches != null && junction.outBranches.Count >= 2;
         }
 
         /// Tally which way the route diverges at each facing junction, so
@@ -297,26 +343,48 @@ namespace DvMod.RemoteDispatch
         /// inferred from the map.
         private static void CountDivergences(List<TrackGraph.Step> path, TrainRoute route)
         {
+            route.divergenceDetail = new JArray();
             for (var i = 0; i + 1 < path.Count; i++)
             {
                 var from = path[i];
                 var to = path[i + 1];
-                var junction = from.ExitJunction;
-                if (junction == null || junction.inBranch == null)
-                    continue;
-                if (junction.inBranch.track != from.track)
-                    continue;   // trailing move: no choice was made here
-                if (junction.outBranches == null || junction.outBranches.Count < 2)
+                if (!IsFacingChoice(from, out var junction))
                     continue;
 
                 var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
                 var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
-                if (IsLeftBranch(approach, outward))
+                var tookLeft = IsLeftBranch(approach, outward);
+                if (tookLeft)
                     route.leftDivergences++;
                 else
                     route.rightDivergences++;
+
+                // Record what the alternatives looked like, so a wrong turn can
+                // be told apart from a turn that had no left-hand option.
+                var options = new JArray();
+                foreach (var branch in junction!.outBranches)
+                {
+                    if (branch == null || branch.track == null)
+                        continue;
+                    var branchOut = TangentAtEnd(branch.track, atInEnd: branch.first, leaving: true);
+                    options.Add(new JObject(
+                        new JProperty("track", DescribeTrack(branch.track)),
+                        new JProperty("side", IsLeftBranch(approach, branchOut) ? "left" : "right"),
+                        new JProperty("taken", branch.track == to.track)));
+                }
+
+                route.divergenceDetail.Add(new JObject(
+                    new JProperty("from", DescribeTrack(from.track)),
+                    new JProperty("to", DescribeTrack(to.track)),
+                    new JProperty("took", tookLeft ? "left" : "right"),
+                    new JProperty("approach", Vec(approach)),
+                    new JProperty("outward", Vec(outward)),
+                    new JProperty("options", options)));
             }
         }
+
+        private static JArray Vec(Vector3 v) => new JArray(
+            System.Math.Round(v.x, 2), System.Math.Round(v.z, 2));
 
         /// A junction already promised to another live route, which needs it set
         /// a different way, cannot be resolved by waiting.
@@ -518,8 +586,63 @@ namespace DvMod.RemoteDispatch
 
             var replacement = SetRoute(trainset, destination, destinationId);
             replacement.rerouteCount = attempts;
+            // The re-laid road was computed from real motion, so its direction is
+            // already confirmed and must not trigger another verification pass.
+            replacement.directionVerified = true;
             if (replacement.status != RouteStatus.Failed)
                 replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
+        }
+
+        /// Re-lay a road once the train is actually moving, if it set off the
+        /// other way.
+        ///
+        /// The direction is chosen when the route is booked, from a train that is
+        /// usually standing still, so it can only be a guess between the two ends
+        /// of the consist. Once there is real motion to read, the guess is
+        /// checked against it and the road re-laid from the direction the train
+        /// is genuinely travelling, which is also what keeps the junctions ahead
+        /// set to the left for that direction.
+        private static void VerifyDirection(TrainRoute route)
+        {
+            if (route.directionVerified || route.pathTracks.Count < 2)
+                return;
+
+            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var lead = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(c => c != null);
+            if (lead == null || lead.rb == null)
+                return;
+
+            var velocity = lead.rb.velocity;
+            velocity.y = 0;
+            if (velocity.sqrMagnitude < 0.25f)
+                return;   // not moving enough to tell yet
+
+            // Where the road goes from the train's current position.
+            var index = Mathf.Clamp(route.progressIndex, 0, route.pathTracks.Count - 2);
+            var here = route.pathTracks[index];
+            var next = route.pathTracks[index + 1];
+            if (here == null || next == null)
+                return;
+
+            var alongRoute = CentreOf(next) - CentreOf(here);
+            alongRoute.y = 0;
+            if (alongRoute.sqrMagnitude < 0.01f)
+                return;
+
+            route.directionVerified = true;
+            if (Vector3.Dot(alongRoute.normalized, velocity.normalized) >= 0f)
+                return;   // travelling the way the road was laid
+
+            Main.DebugLog(() => $"Route {route.id}: train set off opposite the booked road; re-laying.");
+            Reroute(route);
+        }
+
+        private static Vector3 CentreOf(RailTrack track)
+        {
+            var curve = track.curve;
+            if (curve == null || curve.pointCount == 0)
+                return track.transform.position;
+            return (curve[0].position + curve[curve.pointCount - 1].position) * 0.5f;
         }
 
         /// Retry deferred junctions. Driven by Updater so it shares the mod's
@@ -532,6 +655,9 @@ namespace DvMod.RemoteDispatch
                 yield return wait;
                 foreach (var route in routes.Values.ToList())
                 {
+                    VerifyDirection(route);
+                    if (!routes.ContainsKey(route.id))
+                        continue;   // re-laid during verification
                     UpdateProgress(route);
                     if (!routes.ContainsKey(route.id))
                         continue;   // arrived or rerouted during the update
@@ -675,6 +801,7 @@ namespace DvMod.RemoteDispatch
             new JProperty("requiresReverse", route.requiresReverse),
             new JProperty("leftDivergences", route.leftDivergences),
             new JProperty("rightDivergences", route.rightDivergences),
+            new JProperty("divergenceDetail", route.divergenceDetail),
             new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
             new JProperty("passedTracks", route.progressIndex));
 
