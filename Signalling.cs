@@ -86,7 +86,7 @@ namespace DvMod.RemoteDispatch
             var aspect = Aspect.Unknown;
             var approachingDistance = -1f;
             var blockAhead = "";
-            ReadDvSignal(start.Value, leadCar.transform.position,
+            ReadDvSignal(start.Value, leadCar.transform.position, ownTrainsetId,
                 out aspect, out approachingDistance, out blockAhead);
 
             // Prefer the limit the game actually posts; fall back to the figure
@@ -99,7 +99,7 @@ namespace DvMod.RemoteDispatch
             return new Reading(aspect, speed, blockAhead, approachingDistance);
         }
 
-        private static void ReadDvSignal(TrackGraph.Step start, Vector3 position,
+        private static void ReadDvSignal(TrackGraph.Step start, Vector3 position, int ownTrainsetId,
             out Aspect aspect, out float distance, out string signalName)
         {
             aspect = Aspect.Unknown;
@@ -117,6 +117,15 @@ namespace DvMod.RemoteDispatch
             signalName = controller.Name;
             distance = Vector3.Distance(position, controller.Position);
             aspect = NswAspect(current);
+
+            // A block occupied solely by loose/unpowered cars is a coupling
+            // target, not an opposing train. Show flashing amber as a
+            // permissive proceed-at-caution indication. The moment any
+            // locomotive occupies the block, DV Signals remains authoritative.
+            var block = signal.Block;
+            if (block != null && Occupancy.ContainsOnlyUnpoweredCars(
+                block.Tracks.Select(info => info.Track), ownTrainsetId))
+                aspect = Aspect.PreliminaryCaution;
         }
 
         internal static BasicSignalController? NextDvSignalController(

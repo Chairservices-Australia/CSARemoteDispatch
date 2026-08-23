@@ -99,5 +99,27 @@ namespace DvMod.RemoteDispatch
             }
             return result;
         }
+
+        /// True when the selected tracks contain another consist but none of
+        /// its occupying vehicles is a locomotive. Used for a permissive
+        /// coupling indication without weakening protection against trains.
+        public static bool ContainsOnlyUnpoweredCars(
+            IEnumerable<RailTrack> tracks, int ignoreTrainsetId = -1)
+        {
+            var wanted = new HashSet<RailTrack>(tracks.Where(track => track != null));
+            var foundCar = false;
+            foreach (var position in AllCarPositions())
+            {
+                if (!wanted.Contains(position.track))
+                    continue;
+                var trainset = position.car.trainset;
+                if (ignoreTrainsetId >= 0 && trainset != null && trainset.id == ignoreTrainsetId)
+                    continue;
+                foundCar = true;
+                if (position.car.IsLoco)
+                    return false;
+            }
+            return foundCar;
+        }
     }
 }
