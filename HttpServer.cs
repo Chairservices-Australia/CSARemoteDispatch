@@ -109,6 +109,15 @@ namespace DvMod.RemoteDispatch
             case "res":
                 RenderResource(context);
                 break;
+            case "signs":
+            {
+                var radiusText = request.QueryString.Get("radius");
+                var radius = float.TryParse(radiusText, out var parsed) ? parsed : SignDiscovery.DefaultRadius;
+                var json = await Updater.RunOnMainThread(
+                    () => SignDiscovery.GetNearbySignsJson(radius)).ConfigureAwait(false);
+                Render200(context, ContentTypes.Json, json);
+                break;
+            }
             case "currentTrain":
                 Render200(context, ContentTypes.Json,
                     CurrentTrain.GetCurrentTrainJson().ToString(Formatting.None));

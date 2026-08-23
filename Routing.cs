@@ -446,14 +446,12 @@ namespace DvMod.RemoteDispatch
         public static void Apply(TrainRoute route)
         {
             route.pending.Clear();
-            foreach (var setting in route.settings)
+            foreach (var setting in PendingSettings(route))
             {
-                if (setting.junction == null)
-                    continue;
                 if (setting.junction.selectedBranch == setting.branch)
                     continue;
                 if (Occupancy.IsJunctionClear(setting.junction, route.trainsetId))
-                    setting.junction.Switch(Junction.SwitchMode.REGULAR, setting.branch);
+                    setting.junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                 else
                     route.pending.Add(setting.junction);
             }
@@ -575,10 +573,8 @@ namespace DvMod.RemoteDispatch
         /// reporting itself as set.
         private static void Revalidate(TrainRoute route)
         {
-            foreach (var setting in route.settings)
+            foreach (var setting in PendingSettings(route))
             {
-                if (setting.junction == null || setting.pathIndex < route.progressIndex)
-                    continue;
                 if (setting.junction.selectedBranch == setting.branch)
                 {
                     route.pending.Remove(setting.junction);
@@ -586,7 +582,7 @@ namespace DvMod.RemoteDispatch
                 }
                 if (Occupancy.IsJunctionClear(setting.junction, route.trainsetId))
                 {
-                    setting.junction.Switch(Junction.SwitchMode.REGULAR, setting.branch);
+                    setting.junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                     route.pending.Remove(setting.junction);
                 }
                 else
@@ -625,6 +621,29 @@ namespace DvMod.RemoteDispatch
             replacement.directionVerified = true;
             if (replacement.status != RouteStatus.Failed)
                 replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
+        }
+
+        /// The settings still to be applied, one per junction.
+        ///
+        /// A road that passes through the same junction twice - which propelling
+        /// and run-round moves do - carries two settings for it, usually wanting
+        /// opposite branches. Asserting both every tick throws the switch back
+        /// and forth continuously. Only the earliest requirement still ahead of
+        /// the train is held; the later one takes over once the train has passed
+        /// the first.
+        private static IEnumerable<JunctionSetting> PendingSettings(TrainRoute route)
+        {
+            var chosen = new Dictionary<Junction, JunctionSetting>();
+            foreach (var setting in route.settings)
+            {
+                if (setting.junction == null || setting.pathIndex < route.progressIndex)
+                    continue;
+                if (chosen.TryGetValue(setting.junction, out var existing)
+                    && existing.pathIndex <= setting.pathIndex)
+                    continue;
+                chosen[setting.junction] = setting;
+            }
+            return chosen.Values;
         }
 
         /// Re-lay a road once the train is actually moving, if it set off the
@@ -720,7 +739,7 @@ namespace DvMod.RemoteDispatch
                         if (setting == null)
                             continue;
                         if (Occupancy.IsJunctionClear(junction, route.trainsetId))
-                            junction.Switch(Junction.SwitchMode.REGULAR, setting.branch);
+                            junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                         else
                             stillPending.Add(junction);
                     }
