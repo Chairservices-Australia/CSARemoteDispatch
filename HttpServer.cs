@@ -109,6 +109,9 @@ namespace DvMod.RemoteDispatch
             case "res":
                 RenderResource(context);
                 break;
+            case "route":
+                HandleRouteRequest(context);
+                break;
             case "station":
                 Render200(context, ContentTypes.Json, Stations.GetStationJSON());
                 break;
@@ -186,6 +189,80 @@ namespace DvMod.RemoteDispatch
         private static bool IsValidJunctionId(int junctionId)
         {
             return junctionId >= 0 && junctionId < RailTrackRegistry.Instance.OrderedJunctions.Length;
+        }
+
+        /// GET  /route                       list active routes
+        /// POST /route/{trainsetId}/{trackId} plan and set a route
+        /// POST /route/{routeId}/clear        release a route and its junctions
+        private static async void HandleRouteRequest(HttpListenerContext context)
+        {
+            var url = context.Request.Url;
+            var segments = url.Segments;
+
+            if (segments.Length == 2 && context.Request.HttpMethod == "GET")
+            {
+                Render200(context, ContentTypes.Json, Routing.AllRoutesJson());
+                return;
+            }
+
+            // Setting a route throws switches, so it needs the same permission
+            // as toggling junctions by hand.
+            if (!Main.settings.permissions.HasJunctionPermission(context.User.Identity.Name))
+            {
+                RenderEmpty(context, 403);
+                return;
+            }
+
+            if (segments.Length == 4 && context.Request.HttpMethod == "POST")
+            {
+                var first = segments[2].TrimEnd('/');
+                var second = Uri.UnescapeDataString(segments[3].TrimEnd('/'));
+
+                if (second == "clear")
+                {
+                    await Updater.RunOnMainThread(() => Routing.ClearRoute(first)).ConfigureAwait(false);
+                    Render200(context, ContentTypes.Json, Routing.AllRoutesJson());
+                    return;
+                }
+
+                if (!int.TryParse(first, out var trainsetId))
+                {
+                    RenderEmpty(context, 404);
+                    return;
+                }
+
+                var json = await Updater.RunOnMainThread(() =>
+                {
+                    var trainset = Trainset.allSets.Find(set => set.id == trainsetId);
+                    if (trainset == null)
+                        return null;
+                    var destination = FindRailTrackById(second);
+                    if (destination == null)
+                        return null;
+                    return Routing.ToJson(Routing.SetRoute(trainset, destination, second));
+                }).ConfigureAwait(false);
+
+                if (json == null)
+                {
+                    RenderEmpty(context, 404);
+                    return;
+                }
+                Render200(context, ContentTypes.Json, json.ToString(Formatting.None));
+                return;
+            }
+
+            RenderEmpty(context, 404);
+        }
+
+        private static RailTrack? FindRailTrackById(string trackId)
+        {
+            foreach (var track in Component.FindObjectsOfType<RailTrack>())
+            {
+                var logicTrack = track == null ? null : track.LogicTrack();
+                if (logicTrack != null && logicTrack.ID.FullID == trackId)
+                    return track;
+            }
+            return null;
         }
 
         private static async void HandleJunctionRequest(HttpListenerContext context)

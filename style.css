@@ -226,3 +226,24 @@ body {
   font-size: 11px;
   opacity: 0.85;
 }
+
+/* routing */
+#routingForm div {
+  margin: 4px 0;
+}
+#routingForm label {
+  display: inline-block;
+  min-width: 7em;
+}
+#routeMessage {
+  font-size: 12px;
+  font-style: italic;
+  min-height: 1.2em;
+}
+#routeList {
+  margin-top: 8px;
+  font-size: 12px;
+}
+.routeStatus-Active { color: #2e7d32; font-weight: bold; }
+.routeStatus-Pending { color: #b8860b; font-weight: bold; }
+.routeStatus-Conflict, .routeStatus-Failed { color: #c62828; font-weight: bold; }

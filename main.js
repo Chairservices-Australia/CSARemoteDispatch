@@ -73,11 +73,41 @@ function getCarScale() {
   return Number(document.getElementById('carSizeDropdown').value) || 1;
 }
 
+// Minimum on-screen width of a car, in pixels, at scale 1. Cars are drawn at
+// true geographic size, which makes them invisible specks when zoomed out, so
+// below this width we stop shrinking them and hold a readable size instead.
+const minCarWidthPx = 7;
+
+function pixelsPerMeter() {
+  const center = map.getCenter();
+  const zoom = map.getZoom();
+  const origin = map.project(center, zoom);
+  const oneMeterNorth = map.project([center.lat + metersToDegrees, center.lng], zoom);
+  return Math.abs(oneMeterNorth.y - origin.y);
+}
+
+// Geographic multiplier for car overlays: true scale times the user's setting
+// while that stays legible, then clamped so cars keep a fixed on-screen size as
+// the map zooms out.
+function getCarRenderScale() {
+  const userScale = getCarScale();
+  const trueWidthPx = carWidthMeters * pixelsPerMeter();
+  if (!isFinite(trueWidthPx) || trueWidthPx <= 0)
+    return userScale;
+  const targetWidthPx = Math.max(trueWidthPx * userScale, minCarWidthPx * userScale);
+  return targetWidthPx / trueWidthPx;
+}
+
+function refreshAllCarMarkers() {
+  for (const carId of carMarkers.keys())
+    updateCarMarker(carId);
+}
+
 document.getElementById('carSizeDropdown')
-  .addEventListener('input', () => {
-    for (const carId of carMarkers.keys())
-      updateCarMarker(carId);
-  });
+  .addEventListener('input', refreshAllCarMarkers);
+
+// Re-render on zoom so the clamp above is recomputed for the new scale.
+map.on('zoomend', refreshAllCarMarkers);
 
 document.getElementById('carColorDropdown')
   .addEventListener('input', () => {
@@ -467,13 +497,121 @@ function applyStationLabelVisibility() {
 const stationsReady = fetch(new URL('/station', location))
   .then(response => response.json())
   .then(stations => {
-    for (const station of stations)
+    const sorted = [...stations].sort((a, b) => a.name.localeCompare(b.name));
+    for (const station of sorted) {
       stationMarkers.set(station.yardId, createStationLabel(station));
+      stationTracks.set(station.yardId, station.tracks || []);
+    }
     applyStationLabelVisibility();
+    fillSelect(
+      routeStationSelect,
+      sorted.map(station => [station.yardId, `${station.yardId} - ${station.name}`]),
+      false);
+    updateRouteTrackList();
+    refreshRoutes();
   });
 
 document.getElementById('stationLabelsCheckbox')
   .addEventListener('input', applyStationLabelVisibility);
+
+/////////////////////
+// routing
+
+const stationTracks = new Map();   // yardId -> [trackId]
+const routeTrainSelect = document.getElementById('routeTrainSelect');
+const routeStationSelect = document.getElementById('routeStationSelect');
+const routeTrackSelect = document.getElementById('routeTrackSelect');
+const routeMessage = document.getElementById('routeMessage');
+const routeListBody = document.getElementById('routeListBody');
+
+function fillSelect(select, entries, keepValue) {
+  const previous = keepValue ? select.value : null;
+  select.innerHTML = '';
+  for (const [value, label] of entries) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  }
+  if (previous !== null && entries.some(([value]) => value === previous))
+    select.value = previous;
+}
+
+// Trains are listed by their locomotive where they have one, since that is how
+// a dispatcher identifies a consist on the map.
+function updateRouteTrainList() {
+  const trainsets = new Map();
+  for (const [carId, carData] of allCarData) {
+    const id = carData.trainsetId;
+    if (id === undefined)
+      continue;
+    if (!trainsets.has(id) || carId.startsWith('L-'))
+      trainsets.set(id, carId);
+  }
+  fillSelect(
+    routeTrainSelect,
+    [...trainsets.entries()].map(([id, carId]) => [String(id), carId]),
+    true);
+}
+
+function updateRouteTrackList() {
+  const tracks = stationTracks.get(routeStationSelect.value) || [];
+  fillSelect(routeTrackSelect, tracks.map(trackId => [trackId, trackId]), true);
+}
+
+routeStationSelect.addEventListener('input', updateRouteTrackList);
+
+function renderRoutes(routes) {
+  routeListBody.innerHTML = '';
+  for (const route of routes) {
+    const row = document.createElement('tr');
+    row.innerHTML =
+      `<td>${route.trainsetId}</td>` +
+      `<td>${route.destinationTrack}</td>` +
+      `<td class="routeStatus routeStatus-${route.status}" title="${route.message}">${route.status}</td>`;
+    const actions = document.createElement('td');
+    const clear = document.createElement('button');
+    clear.textContent = 'Clear';
+    clear.addEventListener('click', () => clearRoute(route.id));
+    actions.appendChild(clear);
+    row.appendChild(actions);
+    routeListBody.appendChild(row);
+  }
+}
+
+function refreshRoutes() {
+  return fetch(new URL('/route', location))
+    .then(response => response.json())
+    .then(renderRoutes)
+    .catch(() => {});
+}
+
+function clearRoute(routeId) {
+  fetch(new URL(`/route/${routeId}/clear`, location), { method: 'POST' })
+    .then(response => response.json())
+    .then(renderRoutes)
+    .catch(() => {});
+}
+
+document.getElementById('routeSetButton')
+  .addEventListener('click', () => {
+    const trainsetId = routeTrainSelect.value;
+    const trackId = routeTrackSelect.value;
+    if (!trainsetId || !trackId) {
+      routeMessage.textContent = 'Select a train and a destination track.';
+      return;
+    }
+    routeMessage.textContent = 'Planning...';
+    fetch(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST' })
+      .then(response => response.status === 403
+        ? Promise.reject(new Error('No junction permission for this user.'))
+        : response.json())
+      .then(route => {
+        routeMessage.textContent = route.message || route.status;
+        refreshRoutes();
+      })
+      .catch(error => { routeMessage.textContent = error.message || 'Routing failed.'; });
+  });
 
 /////////////////////
 // junctions
@@ -908,7 +1046,7 @@ function updateCarMarker(carId) {
 
 function getCarOverlayBounds(carData) {
   const position = carData.position;
-  const scale = getCarScale();
+  const scale = getCarRenderScale();
   const length = metersToDegrees * carData.length * scale;
   const width = metersToDegrees * carWidthMeters * scale;
   return [ [ position[0] - width/2, position[1] - length/2], [position[0] + width/2, position[1] + length/2] ];

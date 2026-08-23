@@ -13,6 +13,7 @@ namespace DvMod.RemoteDispatch
             StartCoroutine(CheckPlayerTransformCoro());
             StartCoroutine(CheckTrainsetsCoro());
             StartCoroutine(DeferredEventsCoro());
+            StartCoroutine(Routing.RetryPendingCoroutine());
         }
 
         private static GameObject? rootObject;

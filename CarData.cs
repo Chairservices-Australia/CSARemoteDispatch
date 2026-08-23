@@ -17,8 +17,9 @@ namespace DvMod.RemoteDispatch
         public readonly string? destinationYardId;
         public readonly TrainCarType carType;
 
-        protected CarData(string guid, float length, World.LatLon latlon, float rotation, string? jobId, string? destinationYardId, TrainCarType carType)
+        protected CarData(string guid, float length, World.LatLon latlon, float rotation, string? jobId, string? destinationYardId, TrainCarType carType, int trainsetId = -1)
         {
+            this.trainsetId = trainsetId;
             this.guid = guid;
             this.latlon = latlon;
             this.rotation = rotation;
@@ -27,6 +28,9 @@ namespace DvMod.RemoteDispatch
             this.destinationYardId = destinationYardId;
             this.carType = carType;
         }
+
+        /// Consist this car belongs to, so the dispatcher can route a whole train.
+        public readonly int trainsetId;
 
         public static CarData From(TrainCar trainCar)
         {
@@ -40,7 +44,8 @@ namespace DvMod.RemoteDispatch
                 rotation: trainCar.transform.eulerAngles.y,
                 jobId: JobData.JobIdForCar(trainCar),
                 destinationYardId: JobData.JobForCar(trainCar)?.chainData?.chainDestinationYardId,
-                carType: trainCar.carType);
+                carType: trainCar.carType,
+                trainsetId: trainCar.trainset == null ? -1 : trainCar.trainset.id);
         }
 
         public virtual JObject ToJson()
@@ -49,7 +54,8 @@ namespace DvMod.RemoteDispatch
                 new JProperty("guid", guid),
                 new JProperty("length", (int)length),
                 new JProperty("position", latlon.ToJson()),
-                new JProperty("rotation", Math.Round(rotation, 2))
+                new JProperty("rotation", Math.Round(rotation, 2)),
+                new JProperty("trainsetId", trainsetId)
             );
         }
 
@@ -136,7 +142,8 @@ namespace DvMod.RemoteDispatch
             rotation: trainCar.transform.eulerAngles.y,
             jobId: JobData.JobIdForCar(trainCar),
             destinationYardId: JobData.JobForCar(trainCar)?.chainData?.chainDestinationYardId,
-            carType: trainCar.carType)
+            carType: trainCar.carType,
+            trainsetId: trainCar.trainset == null ? -1 : trainCar.trainset.id)
         {
             ILocomotiveRemoteControl controller = trainCar.GetComponent<ILocomotiveRemoteControl>();
             canCouple = controller.IsCouplerInRange(ExternalCouplingHandler.COUPLING_RANGE);

@@ -20,6 +20,7 @@
       <li><a href="#carsTab" role="tab"><i class="fas fa-train" title="Cars"></i></a></li>
       <li><a href="#jobsTab" role="tab"><i class="fas fa-clipboard-list" title="Jobs"></i></a></li>
       <li><a href="#locoControlTab" role="tab"><i class="fas fa-gamepad" title="Loco Control"></i></a></li>
+      <li><a href="#routingTab" role="tab"><i class="fas fa-route" title="Routing"></i></a></li>
       <li><a href="#settingsTab" role="tab"><i class="fas fa-cog" title="Settings"></i></a></li>
     </ul>
   </div>
@@ -73,6 +74,32 @@
         </div>
       </div>
     </div>
+    <div class="leaflet-sidebar-pane" id="routingTab">
+      <div id="routingForm">
+        <div>
+          <label for="routeTrainSelect">Train</label>
+          <select id="routeTrainSelect"></select>
+        </div>
+        <div>
+          <label for="routeStationSelect">Station</label>
+          <select id="routeStationSelect"></select>
+        </div>
+        <div>
+          <label for="routeTrackSelect">Platform / track</label>
+          <select id="routeTrackSelect"></select>
+        </div>
+        <div>
+          <button id="routeSetButton">Set route</button>
+        </div>
+        <div id="routeMessage"></div>
+      </div>
+      <table id="routeList">
+        <thead>
+          <tr><th>Train</th><th>To</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="routeListBody"></tbody>
+      </table>
+    </div>
     <div class="leaflet-sidebar-pane" id="settingsTab">
       <table>
         <tr>
@@ -90,8 +117,8 @@
             <select name="carSize" id="carSizeDropdown">
               <option value="1">Normal</option>
               <option value="1.5">Large</option>
-              <option value="2" selected>Larger</option>
-              <option value="3">Huge</option>
+              <option value="2">Larger</option>
+              <option value="3" selected>Huge</option>
             </select>
           </td>
         </tr>
