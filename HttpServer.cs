@@ -229,7 +229,7 @@ namespace DvMod.RemoteDispatch
         }
 
         /// GET  /route                       list active routes
-        /// POST /route/{trainsetId}/{trackId} plan and set a route
+        /// POST /route/{trainsetId-or-carGuid}/{trackId} plan and set a route
         /// POST /route/{routeId}/clear        release a route and its junctions
         private static async Task HandleRouteRequest(HttpListenerContext context)
         {
@@ -268,23 +268,18 @@ namespace DvMod.RemoteDispatch
                     return;
                 }
 
-                if (!int.TryParse(first, out var trainsetId))
-                {
-                    RenderError(context, 404, "\"" + first + "\" is not a train ID.");
-                    return;
-                }
-
                 string? failure = null;
                 var json = await Updater.RunOnMainThread(() =>
                 {
-                    var trainset = Trainset.allSets.Find(set => set.id == trainsetId);
+                    Trainset? trainset = null;
+                    if (int.TryParse(first, out var trainsetId))
+                        trainset = Trainset.allSets.Find(set => set.id == trainsetId);
+                    else
+                        trainset = TrainCarRegistry.Instance
+                            .GetTrainCarByCarGuid(first)?.trainset;
                     if (trainset == null)
                     {
-                        // The page routes by the consist id it last saw, and
-                        // coupling or uncoupling builds a new one, so a stale
-                        // page can ask for a train that no longer exists.
-                        failure = "Train " + trainsetId + " no longer exists - it was probably"
-                            + " coupled or uncoupled. Reload the page and pick it again.";
+                        failure = "The selected train is no longer available.";
                         return null;
                     }
                     var destination = FindRailTrackById(second);
@@ -293,7 +288,9 @@ namespace DvMod.RemoteDispatch
                         failure = "No track called \"" + second + "\".";
                         return null;
                     }
-                    return Routing.ToJson(Routing.SetRoute(trainset, destination, second));
+                    var route = Routing.SetRoute(trainset, destination, second);
+                    route.requestedBy = context.User.Identity.Name ?? "";
+                    return Routing.ToJson(route);
                 }).ConfigureAwait(false);
 
                 if (json == null)

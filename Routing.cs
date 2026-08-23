@@ -402,6 +402,13 @@ namespace DvMod.RemoteDispatch
             var goals = new HashSet<RailTrack>(FindTracks(destinationTrackId));
             if (goals.Count == 0)
                 goals.Add(destination);
+            var occupiedByOthers = new HashSet<RailTrack>();
+            var poweredByOthers = new HashSet<RailTrack>();
+            Occupancy.OccupiedTracksByOthers(
+                trainset.id, occupiedByOthers, poweredByOthers);
+            bool IsBlocked(TrackGraph.Step step) =>
+                occupiedByOthers.Contains(step.track)
+                && (!goals.Contains(step.track) || poweredByOthers.Contains(step.track));
             List<TrackGraph.Step>? path = null;
             var chosen = candidates[0];
             var shortestLength = float.MaxValue;
@@ -414,7 +421,8 @@ namespace DvMod.RemoteDispatch
             // settle onto the left without sending trains on large detours.
             foreach (var candidate in candidates)
             {
-                var found = TrackGraph.FindPath(candidate, goals, extraCost: LeftHandRunningPenalty);
+                var found = TrackGraph.FindPath(candidate, goals,
+                    extraCost: LeftHandRunningPenalty, isBlocked: IsBlocked);
                 if (found == null)
                     continue;
                 var length = PathLength(found);
@@ -432,7 +440,8 @@ namespace DvMod.RemoteDispatch
             // Where no single-direction road exists - or where one exists but
             // is far enough round to be worse than stopping and changing ends -
             // look for a road that runs out and sets back.
-            var reversal = PlanReversal(candidates, goals, ConsistLength(trainset));
+            var reversal = PlanReversal(
+                candidates, goals, ConsistLength(trainset), IsBlocked);
             var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
 
             if (path == null && !useReversal)
@@ -534,7 +543,8 @@ namespace DvMod.RemoteDispatch
         /// does is pull out far enough to stand clear, then set back over it
         /// onto the other road, and that is what this looks for.
         private static ReversalPlan? PlanReversal(
-            List<TrackGraph.Step> candidates, HashSet<RailTrack> goals, float consistLength)
+            List<TrackGraph.Step> candidates, HashSet<RailTrack> goals, float consistLength,
+            System.Func<TrackGraph.Step, bool> isBlocked)
         {
             // One sweep out of the destination says which states can still reach
             // it, so the thousands of places a train might stand can be filtered
@@ -547,7 +557,8 @@ namespace DvMod.RemoteDispatch
             foreach (var candidate in candidates)
             {
                 var exploration = TrackGraph.Explore(
-                    candidate, MaxRunOutMeters, extraCost: LeftHandRunningPenalty);
+                    candidate, MaxRunOutMeters, extraCost: LeftHandRunningPenalty,
+                    isBlocked: isBlocked);
 
                 // The train has to stand entirely beyond the turnout it will set
                 // back over, so a run-out shorter than the consist is no use
@@ -565,7 +576,8 @@ namespace DvMod.RemoteDispatch
                 foreach (var entry in viable)
                 {
                     var inbound = TrackGraph.FindPath(
-                        TrackGraph.Flip(entry.Key), goals, extraCost: LeftHandRunningPenalty);
+                        TrackGraph.Flip(entry.Key), goals,
+                        extraCost: LeftHandRunningPenalty, isBlocked: isBlocked);
                     if (inbound == null || inbound.Count == 0)
                         continue;
                     var outbound = exploration.PathTo(entry.Key);
@@ -643,8 +655,15 @@ namespace DvMod.RemoteDispatch
             if (occupied.Count == 0)
                 return false;
 
-            // Every part of the train must be on the far end of the outbound
-            // road: the reversal track itself, or something past it.
+            // Clearing the actual turnout is authoritative. A long consist can
+            // span several RailTrack components beyond it, so requiring every
+            // bogie to occupy the final planned component leaves valid moves
+            // stuck in AwaitingReversal forever.
+            if (route.reversalJunction != null)
+                return Occupancy.IsJunctionClear(route.reversalJunction);
+
+            // A degenerate reversal with no turnout still needs the entire
+            // consist on its final outbound component.
             var reversalTrack = route.pathTracks.Count == 0
                 ? null : route.pathTracks[route.pathTracks.Count - 1];
             if (reversalTrack == null)
@@ -655,10 +674,7 @@ namespace DvMod.RemoteDispatch
                     return false;
             }
 
-            // Nothing of ours may still be fouling the turnout, or setting back
-            // over it would derail the train.
-            return route.reversalJunction == null
-                || Occupancy.IsJunctionClear(route.reversalJunction);
+            return true;
         }
 
         /// Hand the road over to the second leg once the train stands clear.

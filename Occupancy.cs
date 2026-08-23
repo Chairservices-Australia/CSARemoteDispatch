@@ -178,6 +178,34 @@ namespace DvMod.RemoteDispatch
             return result;
         }
 
+        /// Tracks occupied by another consist, separated into any occupancy and
+        /// powered-train occupancy. Routing avoids all occupied through tracks,
+        /// while an unpowered destination remains usable for a coupling move.
+        public static void OccupiedTracksByOthers(
+            int ownTrainsetId, HashSet<RailTrack> occupied, HashSet<RailTrack> powered)
+        {
+            occupied.Clear();
+            powered.Clear();
+            var positions = new List<CarPosition>();
+            var poweredTrainsets = new HashSet<int>();
+            foreach (var position in AllCarPositions())
+            {
+                var trainset = position.car.trainset;
+                if (trainset != null && trainset.id == ownTrainsetId)
+                    continue;
+                positions.Add(position);
+                occupied.Add(position.track);
+                if (position.car.IsLoco && trainset != null)
+                    poweredTrainsets.Add(trainset.id);
+            }
+            foreach (var position in positions)
+            {
+                var trainset = position.car.trainset;
+                if (trainset != null && poweredTrainsets.Contains(trainset.id))
+                    powered.Add(position.track);
+            }
+        }
+
         /// True when the selected tracks contain another consist but none of
         /// its occupying vehicles is a locomotive. Used for a permissive
         /// coupling indication without weakening protection against trains.

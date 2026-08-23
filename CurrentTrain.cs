@@ -24,6 +24,7 @@ namespace DvMod.RemoteDispatch
             return new JObject(
                 new JProperty("inTrain", true),
                 new JProperty("carId", car.ID),
+                new JProperty("carGuid", car.CarGUID),
                 new JProperty("trainsetId", trainset == null ? -1 : trainset.id),
                 new JProperty("jobId", job?.ID),
                 new JProperty("jobType", job?.jobType.ToString()),

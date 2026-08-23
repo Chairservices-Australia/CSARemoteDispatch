@@ -342,9 +342,13 @@ body {
 /* Tables ----------------------------------------------------------- */
 table {
   color: var(--rd-text);
+  background: var(--rd-panel);
+  border-color: var(--rd-border);
 }
 table th {
   color: var(--rd-text-muted);
+  background: var(--rd-panel-alt);
+  background-image: none;
   border-bottom: 1px solid var(--rd-border);
 }
 table td {
@@ -429,6 +433,20 @@ input[type="range"] {
   padding: 2px 8px;
   font-size: 11px;
   font-weight: 500;
+}
+#routeList {
+  table-layout: auto;
+}
+#routeList th,
+#routeList td {
+  overflow-wrap: anywhere;
+}
+#routeList .routeMessage {
+  color: var(--rd-text-muted);
+  background: var(--rd-panel);
+}
+#routeList .routeMessage-action {
+  color: #d5a6ff;
 }
 
 /* Loco control buttons -------------------------------------------- */

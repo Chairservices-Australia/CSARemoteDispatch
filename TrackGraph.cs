@@ -195,6 +195,7 @@ namespace DvMod.RemoteDispatch
             Step start,
             float maxDistance,
             Func<Step, Step, float>? extraCost = null,
+            Func<Step, bool>? isBlocked = null,
             int maxExpansions = 20000)
         {
             var result = new Exploration { start = start };
@@ -218,6 +219,8 @@ namespace DvMod.RemoteDispatch
 
                 foreach (var next in Successors(step))
                 {
+                    if (isBlocked != null && isBlocked(next))
+                        continue;
                     var penalty = extraCost == null ? 0f : extraCost(step, next);
                     if (float.IsPositiveInfinity(penalty))
                         continue;

@@ -112,12 +112,14 @@ function followPlayer() {
 // Follow whichever train is selected in the routing tab, so the dispatcher can
 // watch the consist it is routing without hunting for it on the map.
 function followSelectedTrain() {
-  const trainsetId = Number(routeTrainSelect.value);
-  if (Number.isNaN(trainsetId)) {
+  const selected = Array.from(allCarData.entries())
+    .find(([_, carData]) => carData.guid === routeTrainSelect.value);
+  if (!selected) {
     followMode = null;
     updateFollowButtons();
     return;
   }
+  const trainsetId = selected[1].trainsetId;
   let target = null;
   for (const [carId, carData] of allCarData) {
     if (carData.trainsetId !== trainsetId)
@@ -686,7 +688,7 @@ function updateRouteTrainList() {
     .filter(([carId, carData]) => carId.startsWith('L-') && carData.trainsetId >= 0)
     .sort(([a], [b]) => a.localeCompare(b));
   for (const [carId, carData] of locos) {
-    entries.push([String(carData.trainsetId), carId]);
+    entries.push([carData.guid, carId]);
     seenTrainsets.add(carData.trainsetId);
   }
 
@@ -700,7 +702,7 @@ function updateRouteTrainList() {
       looseCars.set(id, carId);
   }
   for (const [id, carId] of [...looseCars.entries()].sort((a, b) => a[1].localeCompare(b[1])))
-    entries.push([String(id), carId + ' (no loco)']);
+    entries.push([allCarData.get(carId).guid, carId + ' (no loco)']);
 
   fillSelect(routeTrainSelect, entries, true);
   applyAutoSelection();
@@ -810,6 +812,7 @@ function renderRoutes(routes) {
     row.appendChild(marker);
 
     appendCell(row, route.trainsetId);
+    appendCell(row, route.requestedBy || 'Local');
     appendCell(row, route.destinationTrack);
     // Built as text rather than interpolated markup: track and signal names
     // come from the world and from other mods, and a quote in one of them used
@@ -832,7 +835,7 @@ function renderRoutes(routes) {
     if (route.message) {
       const note = document.createElement('tr');
       const cell = document.createElement('td');
-      cell.colSpan = 5;
+      cell.colSpan = 6;
       cell.className = 'routeMessage'
         + (route.status === 'AwaitingReversal' ? ' routeMessage-action' : '');
       cell.textContent = route.message;
@@ -857,8 +860,8 @@ function clearRoute(routeId) {
 // Detect the consist the player is riding in and the job it is working, so
 // being aboard and pressing Set route is enough: the train and its booked
 // destination are already selected.
-let autoDetectedTrainsetId = null;
-let autoAppliedTrainsetId = null;      // the last one actually selected
+let autoDetectedTrainGuid = null;
+let autoAppliedTrainGuid = null;      // the last one actually selected
 let autoDestinationTrack = null;
 
 function selectStationForTrack(trackDisplayId) {
@@ -887,12 +890,12 @@ function selectStationForTrack(trackDisplayId) {
 // a value it has no option for silently does nothing, so this retries until the
 // option exists rather than giving up after one attempt.
 function applyAutoSelection() {
-  if (autoDetectedTrainsetId === null)
+  if (autoDetectedTrainGuid === null)
     return;
-  if (autoAppliedTrainsetId === autoDetectedTrainsetId)
+  if (autoAppliedTrainGuid === autoDetectedTrainGuid)
     return;
 
-  const wanted = String(autoDetectedTrainsetId);
+  const wanted = autoDetectedTrainGuid;
   const hasOption = Array.from(routeTrainSelect.options).some(option => option.value === wanted);
   if (!hasOption)
     return;
@@ -900,7 +903,7 @@ function applyAutoSelection() {
   routeTrainSelect.value = wanted;
   if (autoDestinationTrack)
     selectStationForTrack(autoDestinationTrack);
-  autoAppliedTrainsetId = autoDetectedTrainsetId;
+  autoAppliedTrainGuid = autoDetectedTrainGuid;
 }
 
 function refreshCurrentTrain() {
@@ -908,19 +911,19 @@ function refreshCurrentTrain() {
     .then(current => {
       const status = document.getElementById('routeCurrentTrain');
       if (!current.inTrain || current.trainsetId < 0) {
-        autoDetectedTrainsetId = null;
-        autoAppliedTrainsetId = null;
+        autoDetectedTrainGuid = null;
+        autoAppliedTrainGuid = null;
         autoDestinationTrack = null;
         if (status)
           status.textContent = 'Not aboard a train.';
         return;
       }
 
-      if (autoDetectedTrainsetId !== current.trainsetId) {
+      if (autoDetectedTrainGuid !== current.carGuid) {
         // A different train: allow the selection to move again.
-        autoAppliedTrainsetId = null;
+        autoAppliedTrainGuid = null;
       }
-      autoDetectedTrainsetId = current.trainsetId;
+      autoDetectedTrainGuid = current.carGuid;
       autoDestinationTrack = current.destinationTrack || null;
       applyAutoSelection();
 
