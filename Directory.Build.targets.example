@@ -1,0 +1,35 @@
+<Project>
+  <!--
+    Copy this file to "Directory.Build.targets" and set DvInstallDir to your
+    Derail Valley install. That filename is gitignored, so each machine keeps
+    its own paths out of version control.
+  -->
+  <PropertyGroup>
+    <DvInstallDir Condition="'$(DvInstallDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Derail Valley</DvInstallDir>
+    <DvManagedDir>$(DvInstallDir)\DerailValley_Data\Managed</DvManagedDir>
+    <DvModDir>$(DvInstallDir)\Mods\CSARemoteDispatch</DvModDir>
+    <AssemblySearchPaths>$(AssemblySearchPaths);$(DvManagedDir)</AssemblySearchPaths>
+  </PropertyGroup>
+
+  <!-- Game/Unity assemblies are provided at runtime: reference, never copy. -->
+  <ItemDefinitionGroup>
+    <Reference>
+      <Private>false</Private>
+    </Reference>
+  </ItemDefinitionGroup>
+
+  <Target Name="CheckDvInstall" BeforeTargets="BeforeBuild" Condition="!Exists('$(DvManagedDir)')">
+    <Error Text="Derail Valley not found at '$(DvInstallDir)'. Set it with -p:DvInstallDir=&quot;...&quot; or edit Directory.Build.targets." />
+  </Target>
+
+  <!-- Opt-in install: dotnet build -p:DeployToGame=true -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(DeployToGame)' == 'true'">
+    <ItemGroup>
+      <StaleCache Include="$(DvModDir)\*.cache" />
+    </ItemGroup>
+    <Delete Files="@(StaleCache)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DvModDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\info.json" DestinationFolder="$(DvModDir)" />
+    <Message Importance="high" Text="Deployed $(TargetFileName) -&gt; $(DvModDir)" />
+  </Target>
+</Project>

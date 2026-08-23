@@ -109,6 +109,9 @@ namespace DvMod.RemoteDispatch
             case "res":
                 RenderResource(context);
                 break;
+            case "station":
+                Render200(context, ContentTypes.Json, Stations.GetStationJSON());
+                break;
             case "track":
                 Render200(context, ContentTypes.Json, await RailTracks.GetTrackPointJSON().ConfigureAwait(false));
                 break;

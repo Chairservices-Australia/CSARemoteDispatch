@@ -1,12 +1,11 @@
 {
-  "Id": "RemoteDispatch",
-  "DisplayName": "Remote Dispatch",
-  "Author": "Zeibach",
+  "Id": "CSARemoteDispatch",
+  "DisplayName": "CSA Remote Dispatch",
+  "Author": "Zeibach (fork)",
   "Version": "1.2.1",
-  "AssemblyName": "RemoteDispatch.dll",
+  "AssemblyName": "CSARemoteDispatch.dll",
   "EntryMethod": "DvMod.RemoteDispatch.Main.Load",
   "LoadAfter": [ "PersistentJobsMod" ],
   "ManagerVersion": "0.27.3",
-  "HomePage": "https://www.nexusmods.com/derailvalley/mods/328",
-  "Repository": "https://raw.githubusercontent.com/mspielberg/dv-remote-dispatch/master/resources/repository.json"
+  "HomePage": "https://github.com/mspielberg/dv-remote-dispatch"
 }

@@ -67,7 +67,7 @@ namespace DvMod.RemoteDispatch
             return tracks.ToDictionary(track => track, track => GetTrackPoints(track, resolution));
         }
 
-        private static IEnumerable<World.Position> GetTrackPoints(RailTrack track, float resolution = SIMPLIFIED_RESOLUTION)
+        public static IEnumerable<World.Position> GetTrackPoints(RailTrack track, float resolution = SIMPLIFIED_RESOLUTION)
         {
             var pointSet = track.GetKinkedPointSet();
             EquiPointSet simplified = EquiPointSet.ResampleEquidistant(

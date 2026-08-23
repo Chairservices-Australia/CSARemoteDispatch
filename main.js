@@ -69,6 +69,16 @@ function getCarColorMode() {
   return document.getElementById('carColorDropdown').value;
 }
 
+function getCarScale() {
+  return Number(document.getElementById('carSizeDropdown').value) || 1;
+}
+
+document.getElementById('carSizeDropdown')
+  .addEventListener('input', () => {
+    for (const carId of carMarkers.keys())
+      updateCarMarker(carId);
+  });
+
 document.getElementById('carColorDropdown')
   .addEventListener('input', () => {
     updateAllCarColors();
@@ -409,6 +419,61 @@ const tracksReady = fetch(new URL('/track', location))
       createTrackLabels(trackId, coords)
   });
 });
+
+/////////////////////
+// stations
+
+const stationMarkers = new Map();
+
+// WCAG relative luminance, so light yards get dark text and vice versa.
+function textColorFor(hexColor) {
+  const match = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hexColor || '');
+  if (!match)
+    return '#fff';
+  const [r, g, b] = [1, 2, 3]
+    .map(i => parseInt(match[i], 16) / 255)
+    .map(c => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.35 ? '#000' : '#fff';
+}
+
+function showStationLabels() {
+  return document.getElementById('stationLabelsCheckbox').checked;
+}
+
+function createStationLabel(station) {
+  const color = station.color || '#888';
+  const icon = L.divIcon({
+    className: 'stationLabel',
+    iconSize: null,
+    html:
+      `<span class="stationLabel-pill" style="background:${color};color:${textColorFor(color)}">` +
+        `<span class="stationLabel-yardId">${station.yardId}</span>` +
+        `<span class="stationLabel-name">${station.name}</span>` +
+      '</span>',
+  });
+  return L.marker(station.position, { icon: icon, interactive: false, zIndexOffset: 900 });
+}
+
+function applyStationLabelVisibility() {
+  const visible = showStationLabels();
+  for (const marker of stationMarkers.values()) {
+    if (visible)
+      marker.addTo(map);
+    else
+      marker.remove();
+  }
+}
+
+const stationsReady = fetch(new URL('/station', location))
+  .then(response => response.json())
+  .then(stations => {
+    for (const station of stations)
+      stationMarkers.set(station.yardId, createStationLabel(station));
+    applyStationLabelVisibility();
+  });
+
+document.getElementById('stationLabelsCheckbox')
+  .addEventListener('input', applyStationLabelVisibility);
 
 /////////////////////
 // junctions
@@ -843,8 +908,9 @@ function updateCarMarker(carId) {
 
 function getCarOverlayBounds(carData) {
   const position = carData.position;
-  const length = metersToDegrees * carData.length;
-  const width = metersToDegrees * carWidthMeters;
+  const scale = getCarScale();
+  const length = metersToDegrees * carData.length * scale;
+  const width = metersToDegrees * carWidthMeters * scale;
   return [ [ position[0] - width/2, position[1] - length/2], [position[0] + width/2, position[1] + length/2] ];
 }
 
