@@ -658,6 +658,7 @@ function updateRouteTrainList() {
     entries.push([String(id), carId + ' (no loco)']);
 
   fillSelect(routeTrainSelect, entries, true);
+  applyAutoSelection();
 }
 
 // Tracks are labelled with the game's display ID ("GF-D5I"), matching what jobs
@@ -752,25 +753,49 @@ function clearRoute(routeId) {
 // being aboard and pressing Set route is enough: the train and its booked
 // destination are already selected.
 let autoDetectedTrainsetId = null;
+let autoAppliedTrainsetId = null;      // the last one actually selected
+let autoDestinationTrack = null;
 
 function selectStationForTrack(trackDisplayId) {
   for (const [yardId, tracks] of stationTracks) {
-    const match = tracks.some(track =>
-      (typeof track === 'string' ? track : track.id) === trackDisplayId ||
-      (typeof track === 'object' && track.display === trackDisplayId));
+    const match = tracks.find(track => typeof track === 'string'
+      ? track === trackDisplayId
+      : track.display === trackDisplayId || track.id === trackDisplayId);
     if (!match)
       continue;
     routeStationSelect.value = yardId;
     updateRouteTrackList();
+    const wanted = typeof match === 'string' ? match : match.id;
     for (const option of routeTrackSelect.options) {
-      if (option.value === trackDisplayId || option.textContent === trackDisplayId) {
-        routeTrackSelect.value = option.value;
+      if (option.value === wanted) {
+        routeTrackSelect.value = wanted;
         return true;
       }
     }
     return false;
   }
   return false;
+}
+
+// Applied separately from detection: the train options are filled from car
+// updates, which can arrive after the first detection poll. Setting a select to
+// a value it has no option for silently does nothing, so this retries until the
+// option exists rather than giving up after one attempt.
+function applyAutoSelection() {
+  if (autoDetectedTrainsetId === null)
+    return;
+  if (autoAppliedTrainsetId === autoDetectedTrainsetId)
+    return;
+
+  const wanted = String(autoDetectedTrainsetId);
+  const hasOption = Array.from(routeTrainSelect.options).some(option => option.value === wanted);
+  if (!hasOption)
+    return;
+
+  routeTrainSelect.value = wanted;
+  if (autoDestinationTrack)
+    selectStationForTrack(autoDestinationTrack);
+  autoAppliedTrainsetId = autoDetectedTrainsetId;
 }
 
 function refreshCurrentTrain() {
@@ -780,28 +805,29 @@ function refreshCurrentTrain() {
       const status = document.getElementById('routeCurrentTrain');
       if (!current.inTrain || current.trainsetId < 0) {
         autoDetectedTrainsetId = null;
+        autoAppliedTrainsetId = null;
+        autoDestinationTrack = null;
         if (status)
           status.textContent = 'Not aboard a train.';
         return;
       }
 
-      // Only move the selection when the detected train changes, so a manual
-      // choice is not overwritten on every poll.
-      const changed = autoDetectedTrainsetId !== current.trainsetId;
-      autoDetectedTrainsetId = current.trainsetId;
-      if (changed) {
-        routeTrainSelect.value = String(current.trainsetId);
-        if (current.destinationTrack)
-          selectStationForTrack(current.destinationTrack);
+      if (autoDetectedTrainsetId !== current.trainsetId) {
+        // A different train: allow the selection to move again.
+        autoAppliedTrainsetId = null;
       }
+      autoDetectedTrainsetId = current.trainsetId;
+      autoDestinationTrack = current.destinationTrack || null;
+      applyAutoSelection();
 
       if (status) {
         const parts = [`Aboard ${current.carId}`];
         if (current.jobId)
           parts.push(`job ${current.jobId}`);
-        if (current.destinationTrack)
-          parts.push(`to ${current.destinationTrack}`);
-        status.textContent = parts.join(' - ');
+        parts.push(current.destinationTrack
+          ? `to ${current.destinationTrack}`
+          : (current.jobId ? 'no destination track on job' : 'no job'));
+        status.textContent = parts.join(' – ');
       }
     })
     .catch(() => {});

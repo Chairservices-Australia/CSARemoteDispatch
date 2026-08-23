@@ -12,6 +12,7 @@ namespace DvMod.RemoteDispatch
         public Junction junction = null!;
         public byte branch;
         public bool facing;   // true when the route runs stem -> branch here
+        public int pathIndex;  // position along the route, for releasing behind the train
     }
 
     public enum RouteStatus { Active, Pending, Conflict, Failed, Cleared }
@@ -28,6 +29,10 @@ namespace DvMod.RemoteDispatch
         public List<string> trackIds = new List<string>();
         public readonly HashSet<Junction> pending = new HashSet<Junction>();
         public bool requiresReverse;
+        public int leftDivergences;
+        public int rightDivergences;
+        public List<RailTrack> pathTracks = new List<RailTrack>();
+        public int progressIndex;   // path entries before this are behind the train
     }
 
     /// Route planning and safe junction setting.
@@ -44,26 +49,50 @@ namespace DvMod.RemoteDispatch
 
         public const float RetryIntervalSeconds = 1f;
 
-        /// Left-hand running: at a facing junction prefer the branch that departs
-        /// to the left of the approach direction, matching Australian practice and
-        /// the paired mainlines the DoubleTrack mod lays down.
-        public static bool IsLeftBranch(Junction junction, Vector3 approachDirection, RailTrack branchTrack)
+        /// Direction of a track at one of its ends, taken from the segment
+        /// nearest that end.
+        ///
+        /// The chord between a track's two endpoints is useless here: a siding
+        /// that curves away from a junction runs almost parallel to the main
+        /// line overall, so the chord cannot tell left from right. Only the
+        /// local tangent at the junction can.
+        private static Vector3 TangentAtEnd(RailTrack track, bool atInEnd, bool leaving)
         {
-            if (branchTrack == null || branchTrack.curve == null || branchTrack.curve.pointCount == 0)
-                return false;
-            var junctionPosition = junction.position;
-            var start = branchTrack.curve[0].position;
-            var end = branchTrack.curve.Last().position;
-            // Head away from the junction along this branch.
-            var outward = Vector3.Distance(start, junctionPosition) <= Vector3.Distance(end, junctionPosition)
-                ? end - start
-                : start - end;
-            outward.y = 0;
+            var curve = track == null ? null : track.curve;
+            if (curve == null || curve.pointCount < 2)
+                return Vector3.zero;
+
+            Vector3 outer, inner;
+            if (atInEnd)
+            {
+                outer = curve[0].position;
+                inner = curve[1].position;
+            }
+            else
+            {
+                outer = curve[curve.pointCount - 1].position;
+                inner = curve[curve.pointCount - 2].position;
+            }
+
+            // Leaving the end points away from the track; arriving at it points
+            // along the direction of travel, which is into the end.
+            var direction = leaving ? inner - outer : outer - inner;
+            direction.y = 0;
+            return direction;
+        }
+
+        /// Left-hand running: at a facing junction prefer the branch that departs
+        /// to the left of the approach direction, matching Australian practice
+        /// and the paired mainlines the DoubleTrack mod lays down.
+        ///
+        /// Unity is left-handed with +X to the right of +Z, so the Y component of
+        /// approach x outward is negative for a turn to the left.
+        public static bool IsLeftBranch(Vector3 approachDirection, Vector3 outwardDirection)
+        {
             var approach = new Vector3(approachDirection.x, 0, approachDirection.z);
-            if (outward.sqrMagnitude < 0.001f || approach.sqrMagnitude < 0.001f)
+            var outward = new Vector3(outwardDirection.x, 0, outwardDirection.z);
+            if (approach.sqrMagnitude < 0.0001f || outward.sqrMagnitude < 0.0001f)
                 return false;
-            // The Y sign of the cross product gives the turn direction in Unity's
-            // left-handed coordinate system: negative is a turn to the left.
             return Vector3.Cross(approach.normalized, outward.normalized).y < 0f;
         }
 
@@ -102,6 +131,7 @@ namespace DvMod.RemoteDispatch
                     junction = junction,
                     branch = (byte)index,
                     facing = facing,
+                    pathIndex = i,
                 });
             }
             return settings;
@@ -204,7 +234,9 @@ namespace DvMod.RemoteDispatch
                 .Where(track => track != null)
                 .Select(track => track.ID.FullDisplayID)
                 .ToList();
+            route.pathTracks = path.Select(step => step.track).ToList();
             route.settings = SettingsForPath(path);
+            CountDivergences(path, route);
 
             var conflict = FirstConflict(route);
             if (conflict != null)
@@ -241,18 +273,38 @@ namespace DvMod.RemoteDispatch
             var facing = junction.inBranch.track == from.track;
             if (!facing || junction.outBranches == null || junction.outBranches.Count < 2)
                 return 0f;
-            return IsLeftBranch(junction, ApproachDirection(from), to.track) ? 0f : LeftTurnPenalty;
+
+            // Arriving at the end of `from` that meets the junction, and leaving
+            // along `to` from the end that meets the same junction.
+            var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
+            var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
+            return IsLeftBranch(approach, outward) ? 0f : LeftTurnPenalty;
         }
 
-        /// Direction of travel as the train leaves `step`.
-        private static Vector3 ApproachDirection(TrackGraph.Step step)
+        /// Tally which way the route diverges at each facing junction, so
+        /// left-hand running can be confirmed from the result rather than
+        /// inferred from the map.
+        private static void CountDivergences(List<TrackGraph.Step> path, TrainRoute route)
         {
-            var curve = step.track.curve;
-            if (curve == null || curve.pointCount < 2)
-                return Vector3.forward;
-            var start = curve[0].position;
-            var end = curve.Last().position;
-            return step.enteredViaIn ? end - start : start - end;
+            for (var i = 0; i + 1 < path.Count; i++)
+            {
+                var from = path[i];
+                var to = path[i + 1];
+                var junction = from.ExitJunction;
+                if (junction == null || junction.inBranch == null)
+                    continue;
+                if (junction.inBranch.track != from.track)
+                    continue;   // trailing move: no choice was made here
+                if (junction.outBranches == null || junction.outBranches.Count < 2)
+                    continue;
+
+                var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
+                var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
+                if (IsLeftBranch(approach, outward))
+                    route.leftDivergences++;
+                else
+                    route.rightDivergences++;
+            }
         }
 
         /// A junction already promised to another live route, which needs it set
@@ -302,10 +354,69 @@ namespace DvMod.RemoteDispatch
         private static void UpdateStatus(TrainRoute route)
         {
             route.status = route.pending.Count > 0 ? RouteStatus.Pending : RouteStatus.Active;
+            var divergences = route.leftDivergences + route.rightDivergences > 0
+                ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
+                : "";
             var prefix = route.requiresReverse ? "Route set (train must reverse). " : "";
             route.message = route.pending.Count > 0
                 ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
-                : (route.requiresReverse ? "Route set - train must reverse to follow it." : "Route set.");
+                : (route.requiresReverse
+                    ? "Route set" + divergences + " - train must reverse to follow it."
+                    : "Route set" + divergences + ".");
+        }
+
+        /// Advance a route past track the train has already run over, so the
+        /// highlighted road shows only what is left and junctions behind the
+        /// train are handed back for other routes to use.
+        ///
+        /// Progress is the rearmost point of the consist still on the route, not
+        /// the front, or track would be released out from under the train.
+        private static void UpdateProgress(TrainRoute route)
+        {
+            if (route.pathTracks.Count == 0)
+                return;
+
+            var occupied = new HashSet<RailTrack>();
+            foreach (var position in Occupancy.AllCarPositions())
+            {
+                var trainset = position.car.trainset;
+                if (trainset != null && trainset.id == route.trainsetId)
+                    occupied.Add(position.track);
+            }
+            if (occupied.Count == 0)
+                return;
+
+            var rearmost = -1;
+            for (var i = route.progressIndex; i < route.pathTracks.Count; i++)
+            {
+                if (occupied.Contains(route.pathTracks[i]))
+                {
+                    rearmost = i;
+                    break;
+                }
+            }
+            if (rearmost <= route.progressIndex)
+                return;
+
+            route.progressIndex = rearmost;
+
+            // Hand back the junctions now behind the train.
+            foreach (var setting in route.settings.Where(s => s.pathIndex < rearmost))
+            {
+                if (reservations.TryGetValue(setting.junction, out var owner) && owner == route.id)
+                    reservations.Remove(setting.junction);
+                route.pending.Remove(setting.junction);
+            }
+
+            // Arrived: the whole road has been run.
+            if (route.progressIndex >= route.pathTracks.Count - 1)
+            {
+                route.status = RouteStatus.Cleared;
+                route.message = "Arrived at " + route.destinationTrackId + ".";
+                ClearRoute(route.id);
+                return;
+            }
+            Sessions.AddTag("routes");
         }
 
         /// Retry deferred junctions. Driven by Updater so it shares the mod's
@@ -318,6 +429,7 @@ namespace DvMod.RemoteDispatch
                 yield return wait;
                 foreach (var route in routes.Values.ToList())
                 {
+                    UpdateProgress(route);
                     if (route.pending.Count == 0)
                         continue;
                     var stillPending = new List<Junction>();
@@ -383,7 +495,10 @@ namespace DvMod.RemoteDispatch
             new JProperty("priority", route.priority),
             new JProperty("pendingJunctions", route.pending.Count),
             new JProperty("requiresReverse", route.requiresReverse),
-            new JProperty("tracks", new JArray(route.trackIds)));
+            new JProperty("leftDivergences", route.leftDivergences),
+            new JProperty("rightDivergences", route.rightDivergences),
+            new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
+            new JProperty("passedTracks", route.progressIndex));
 
         public static string AllRoutesJson() =>
             new JArray(routes.Values.Select(ToJson)).ToString(Newtonsoft.Json.Formatting.None);
