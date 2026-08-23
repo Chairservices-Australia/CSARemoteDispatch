@@ -29,6 +29,14 @@
     <Reference Include="Newtonsoft.Json"/>
     <Reference Include="net.smkd.vector3d"/>
     <Reference Include="WorldStreamer" />
+    <Reference Include="Signals.Common">
+      <HintPath>$(DvInstallDir)\Mods\DVSignals\Signals.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Signals.Game">
+      <HintPath>$(DvInstallDir)\Mods\DVSignals\Signals.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>

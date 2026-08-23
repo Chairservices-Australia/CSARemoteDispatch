@@ -89,36 +89,27 @@ namespace DvMod.RemoteDispatch
 
         /// A point on a branch a little way out from the junction it leaves.
         ///
-        /// Walks the bezier curve rather than the sampled point set: curve points
-        /// are transform positions, the same frame as Junction.position, while
-        /// GetKinkedPointSet returns coordinates that are not shifted by the
-        /// world mover. Subtracting one from the other leaves the mover offset in
-        /// the result, which is far larger than any track geometry and drowns the
-        /// answer entirely.
+        /// Sampled with GetPointAt, which follows the curve including its
+        /// handles. Stepping between anchor points instead was the fault behind
+        /// every wrong turn: a plain bezier has only two anchors, so one step
+        /// spans the whole track and the "forty metres out" sample landed at the
+        /// far end, hundreds of metres away and around whatever curve lay
+        /// between. Both the approach line and the branches were being measured
+        /// there, which is why two legs of one turnout could read the same side.
         private static Vector3 PointAlong(RailTrack track, bool fromInEnd, float distance)
         {
             var curve = track == null ? null : track.curve;
-            if (curve == null || curve.pointCount == 0)
+            if (curve == null || curve.pointCount < 2)
                 return track == null ? Vector3.zero : track.transform.position;
 
-            var startIndex = fromInEnd ? 0 : curve.pointCount - 1;
-            var stepDir = fromInEnd ? 1 : -1;
-            var origin = curve[startIndex].position;
+            var length = Mathf.Max(1f, TrackGraph.TrackLength(track!));
+            // t runs from the in end to the out end, so approach from the far
+            // end by walking t backwards.
+            var fraction = Mathf.Clamp01(distance / length);
+            var t = fromInEnd ? fraction : 1f - fraction;
 
-            var travelled = 0f;
-            var previous = origin;
-            for (var i = startIndex + stepDir; i >= 0 && i < curve.pointCount; i += stepDir)
-            {
-                var here = curve[i].position;
-                travelled += Vector3.Distance(previous, here);
-                previous = here;
-                if (travelled >= distance)
-                    return new Vector3(here.x, 0f, here.z);
-            }
-
-            // Shorter than the sample distance: its far end is the best answer.
-            var far = curve[fromInEnd ? curve.pointCount - 1 : 0].position;
-            return new Vector3(far.x, 0f, far.z);
+            var point = curve.GetPointAt(t);
+            return new Vector3(point.x, 0f, point.z);
         }
 
         /// Which side of the approach a branch lies on.
@@ -163,7 +154,7 @@ namespace DvMod.RemoteDispatch
             var curve = track == null ? null : track.curve;
             if (curve == null || curve.pointCount == 0)
                 return track == null ? Vector3.zero : track.transform.position;
-            var p = curve[atInEnd ? 0 : curve.pointCount - 1].position;
+            var p = curve.GetPointAt(atInEnd ? 0f : 1f);
             return new Vector3(p.x, 0f, p.z);
         }
 
@@ -297,9 +288,18 @@ namespace DvMod.RemoteDispatch
                     occupied.Add(position.track);
             }
 
-            var goals = new HashSet<RailTrack> { destination };
+            // One logical destination can consist of multiple RailTrack objects
+            // (and modded layouts commonly duplicate an ID across their physical
+            // segments). Treat every matching component as a goal; selecting the
+            // first object alone can choose an isolated duplicate and report no
+            // route despite the platform being connected.
+            var goals = new HashSet<RailTrack>(FindTracks(destinationTrackId));
+            if (goals.Count == 0)
+                goals.Add(destination);
             List<TrackGraph.Step>? path = null;
             var chosen = candidates[0];
+            var fewestRightTurns = int.MaxValue;
+            var shortestLength = float.MaxValue;
 
             // Candidates are ordered with the outward direction of each end
             // first, so a pull is tried before the equivalent propelling move.
@@ -308,10 +308,15 @@ namespace DvMod.RemoteDispatch
                 var found = TrackGraph.FindPath(candidate, goals, extraCost: RightHandPenalty);
                 if (found == null)
                     continue;
-                if (path == null || PathLength(found) < PathLength(path))
+                var rightTurns = CountRightHandChoices(found);
+                var length = PathLength(found);
+                if (path == null || rightTurns < fewestRightTurns
+                    || (rightTurns == fewestRightTurns && length < shortestLength))
                 {
                     path = found;
                     chosen = candidate;
+                    fewestRightTurns = rightTurns;
+                    shortestLength = length;
                 }
             }
 
@@ -379,18 +384,43 @@ namespace DvMod.RemoteDispatch
 
             var junctionPosition = junction!.position;
             var approach = ApproachAtJunction(from);
-            if (IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn))
-                return 0f;
+            var chosenOffset = LateralOffset(junctionPosition, approach, to.track, to.enteredViaIn);
 
-            // Only charged when there is a left-hand road to take instead.
+            // "Left" is relative to the other available roads. At a skewed or
+            // curved turnout every branch can lie to the right of the approach
+            // centreline, but the road with the greatest signed offset is still
+            // the left-hand road. Testing offset > 0 made those junctions appear
+            // to have no left option and allowed the rightmost road to win.
+            var leftmostOffset = LeftmostOffset(junction, junctionPosition, approach);
+            return chosenOffset < leftmostOffset - BranchSideToleranceMeters
+                ? RightHandCost
+                : 0f;
+        }
+
+        private const float BranchSideToleranceMeters = 0.25f;
+
+        private static float LeftmostOffset(Junction junction, Vector3 junctionPosition, Vector3 approach)
+        {
+            var leftmost = float.MinValue;
             foreach (var branch in junction.outBranches)
             {
-                if (branch == null || branch.track == null || branch.track == to.track)
+                if (branch == null || branch.track == null)
                     continue;
-                if (IsLeftBranch(junctionPosition, approach, branch.track, branch.first))
-                    return RightHandCost;
+                leftmost = Mathf.Max(leftmost,
+                    LateralOffset(junctionPosition, approach, branch.track, branch.first));
             }
-            return 0f;
+            return leftmost;
+        }
+
+        private static int CountRightHandChoices(List<TrackGraph.Step> path)
+        {
+            var count = 0;
+            for (var i = 0; i + 1 < path.Count; i++)
+            {
+                if (RightHandPenalty(path[i], path[i + 1]) > 0f)
+                    count++;
+            }
+            return count;
         }
 
         /// True when the route arrives on the stem here and the switch actually
@@ -420,7 +450,8 @@ namespace DvMod.RemoteDispatch
 
                 var junctionPosition = junction!.position;
                 var approach = ApproachAtJunction(from);
-                var tookLeft = IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn);
+                var leftmostOffset = LeftmostOffset(junction, junctionPosition, approach);
+                var tookLeft = RightHandPenalty(from, to) == 0f;
                 if (tookLeft)
                     route.leftDivergences++;
                 else
@@ -436,7 +467,8 @@ namespace DvMod.RemoteDispatch
                     var offset = LateralOffset(junctionPosition, approach, branch.track, branch.first);
                     options.Add(new JObject(
                         new JProperty("track", DescribeTrack(branch.track)),
-                        new JProperty("side", offset > 0f ? "left" : "right"),
+                        new JProperty("side", offset >= leftmostOffset - BranchSideToleranceMeters
+                            ? "left" : "right"),
                         new JProperty("offset", System.Math.Round(offset, 2)),
                         new JProperty("taken", branch.track == to.track)));
                 }
@@ -593,15 +625,21 @@ namespace DvMod.RemoteDispatch
 
         public static RailTrack? FindTrack(string trackId)
         {
+            foreach (var track in FindTracks(trackId))
+                return track;
+            return null;
+        }
+
+        public static IEnumerable<RailTrack> FindTracks(string trackId)
+        {
             foreach (var track in Component.FindObjectsOfType<RailTrack>())
             {
                 var logicTrack = track == null ? null : track.LogicTrack();
                 if (logicTrack == null)
                     continue;
                 if (logicTrack.ID.FullDisplayID == trackId || logicTrack.ID.FullID == trackId)
-                    return track;
+                    yield return track!;
             }
-            return null;
         }
 
         /// Re-assert the road ahead. A junction can be thrown by hand, or by

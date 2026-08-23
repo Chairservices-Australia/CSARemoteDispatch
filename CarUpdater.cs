@@ -11,6 +11,8 @@ namespace DvMod.RemoteDispatch
 {
     public static class CarUpdater
     {
+        private static bool started;
+
         public static void ForceCarRefresh()
         {
             Sessions.AddTag("cars");
@@ -51,6 +53,8 @@ namespace DvMod.RemoteDispatch
 
         public static void Start()
         {
+            if (started)
+                return;
             CarSpawner carSpawner = SingletonBehaviour<CarSpawner>.Instance;
             if (carSpawner == null)
             {
@@ -63,18 +67,23 @@ namespace DvMod.RemoteDispatch
 
             foreach (var controller in LocoRestorationController.allLocoRestorationControllers)
                 controller.StateChanged += OnRestorationStateChanged;
+            started = true;
         }
 
         public static void Stop()
         {
-            CarSpawner carSpawner = SingletonBehaviour<CarSpawner>.Instance;
-            if (carSpawner == null)
+            if (!started)
                 return;
-            carSpawner.CarSpawned -= OnCarsChanged;
-            carSpawner.CarAboutToBeDeleted -= OnCarsChanged;
+            CarSpawner carSpawner = SingletonBehaviour<CarSpawner>.Instance;
+            if (carSpawner != null)
+            {
+                carSpawner.CarSpawned -= OnCarsChanged;
+                carSpawner.CarAboutToBeDeleted -= OnCarsChanged;
+            }
 
             foreach (var controller in LocoRestorationController.allLocoRestorationControllers)
                 controller.StateChanged -= OnRestorationStateChanged;
+            started = false;
         }
 
         private static void OnCarsChanged(TrainCar trainCar)

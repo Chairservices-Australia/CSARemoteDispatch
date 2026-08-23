@@ -14,7 +14,6 @@ namespace DvMod.RemoteDispatch
             StartCoroutine(CheckTrainsetsCoro());
             StartCoroutine(DeferredEventsCoro());
             StartCoroutine(Routing.RetryPendingCoroutine());
-            StartCoroutine(SignalEnforcement.EnforceCoroutine());
         }
 
         private static GameObject? rootObject;

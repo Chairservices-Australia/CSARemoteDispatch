@@ -89,6 +89,29 @@ namespace DvMod.RemoteDispatch
 
             DrawSpeedSign(new Rect(signX, signY, SignSize, SignSize), reading.speedLimitKph);
             DrawSignal(new Rect(signalX, signalY, signalWidth, signalHeight), reading.aspect);
+            if ((reading.aspect == Aspect.Stop || reading.aspect == Aspect.Caution
+                    || reading.aspect == Aspect.PreliminaryCaution)
+                && reading.approachingDistanceMeters >= 0f)
+            {
+                DrawApproaching(new Rect(signalX - 45f, signalY + signalHeight + 5f,
+                    signalWidth + 90f, 42f), reading.approachingDistanceMeters);
+            }
+        }
+
+        private static void DrawApproaching(Rect rect, float distanceMeters)
+        {
+            var style = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.UpperCenter,
+                fontSize = 13,
+                fontStyle = FontStyle.Bold,
+                wordWrap = false,
+            };
+            style.normal.textColor = Color.white;
+            var distance = distanceMeters >= 1000f
+                ? (distanceMeters / 1000f).ToString("0.0") + " km"
+                : Mathf.RoundToInt(distanceMeters) + " m";
+            GUI.Label(rect, "Approaching:\n" + distance, style);
         }
 
         private void DrawSpeedSign(Rect rect, int kph)
@@ -173,11 +196,14 @@ namespace DvMod.RemoteDispatch
             if (signalBodyTexture != null)
                 GUI.DrawTexture(rect, signalBodyTexture);
 
-            // Green at the top, amber in the middle, red at the bottom.
+            // Green at the top, amber in the middle, red at the bottom. A
+            // preliminary caution flashes the amber lamp at one hertz.
+            var amberLit = aspect == Aspect.Caution
+                || (aspect == Aspect.PreliminaryCaution && Mathf.FloorToInt(Time.time * 2f) % 2 == 0);
             var lit = new[]
             {
                 aspect == Aspect.Clear,
-                aspect == Aspect.Caution,
+                amberLit,
                 aspect == Aspect.Stop,
             };
 

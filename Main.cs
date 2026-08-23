@@ -117,6 +117,9 @@ namespace DvMod.RemoteDispatch
             Updater.Destroy();
             HttpServer.Destroy();
             SignalHud.Destroy();
+            Routing.ClearAll();
+            SpeedSigns.Reset();
+            Signalling.Reset();
         }
 
         public static void DebugLog(TrainCar car, Func<string> message)

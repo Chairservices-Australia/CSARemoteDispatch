@@ -78,58 +78,38 @@ namespace DvMod.RemoteDispatch
                 yield return new World.Position((float)pt.position.x, (float)pt.position.z);
         }
 
-        private static string? trackPointJSON;
-
         private static string GenerateTrackPointJSON()
         {
-            trackPointJSON = JsonConvert.SerializeObject(
+            return JsonConvert.SerializeObject(
                 GetNormalizedTrackCoordinates().ToDictionary(
                     kvp => kvp.Key.LogicTrack().ID,
                     kvp => kvp.Value.Select(ll => ll.ToJson())));
-            return trackPointJSON;
         }
 
-        public static async Task<string> GetTrackPointJSON()
+        public static Task<string> GetTrackPointJSON()
         {
-            if (trackPointJSON != null)
-                return trackPointJSON;
-            if (!WorldStreamingInit.Instance)
+            if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
                 throw new Exception("World not yet loaded");
-
-            if (WorldStreamingInit.IsLoaded)
-                return GenerateTrackPointJSON();
-
-            var tcs = new TaskCompletionSource<string>();
-            WorldStreamingInit.LoadingFinished += () => tcs.TrySetResult(GenerateTrackPointJSON());
-            if (WorldStreamingInit.IsLoaded)
-                return GenerateTrackPointJSON();
-
-            return await tcs.Task.ConfigureAwait(false);
+            return Task.FromResult(GenerateTrackPointJSON());
         }
     }
 
     public static class Junctions
     {
-        private static string junctionPointJSON = string.Empty;
-
         public static string GetJunctionPointJSON()
         {
             if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
                 throw new Exception("World not yet loaded");
-            if (string.IsNullOrEmpty(junctionPointJSON))
-            {
-                junctionPointJSON = JsonConvert.SerializeObject(
-                    RailTrackRegistry.Instance.OrderedJunctions.Select(j =>
-                    {
-                        var moved = j.position - WorldMover.currentMove;
-                        return new JObject(
-                            new JProperty("position", new World.Position(moved.x, moved.z).ToLatLon().ToJson()),
-                            new JProperty("branches", j.outBranches.Select(b => b.track.LogicTrack().ID.ToString()))
-                        );
-                    })
-                );
-            }
-            return junctionPointJSON;
+            return JsonConvert.SerializeObject(
+                RailTrackRegistry.Instance.OrderedJunctions.Select(j =>
+                {
+                    var moved = j.position - WorldMover.currentMove;
+                    return new JObject(
+                        new JProperty("position", new World.Position(moved.x, moved.z).ToLatLon().ToJson()),
+                        new JProperty("branches", j.outBranches.Select(b => b.track.LogicTrack().ID.ToString()))
+                    );
+                })
+            );
         }
 
         public static IEnumerable<byte> GetAllJunctionStates()

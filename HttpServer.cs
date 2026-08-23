@@ -24,7 +24,16 @@ namespace DvMod.RemoteDispatch
                 listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous | AuthenticationSchemes.Basic;
                 listener.Realm = "DV Remote Dispatch";
                 Main.DebugLog(() => $"Starting HTTP server on port {Main.settings.serverPort}");
-                listener.Start();
+                try
+                {
+                    listener.Start();
+                }
+                catch (Exception e)
+                {
+                    Main.mod?.Logger.Error(
+                        $"Could not start HTTP server on port {Main.settings.serverPort}: {e.Message}");
+                    return;
+                }
             }
 
             while (listener.IsListening)
@@ -55,6 +64,15 @@ namespace DvMod.RemoteDispatch
                 catch (ObjectDisposedException e) when (e.ObjectName == "listener")
                 {
                     // ignore when OnDestroy() is called to shutdown the server
+                }
+                catch (HttpListenerException) when (!listener.IsListening)
+                {
+                    // Stop() interrupts a pending GetContextAsync call.
+                }
+                catch (Exception e)
+                {
+                    Main.mod?.Logger.Error($"HTTP listener stopped unexpectedly: {e}");
+                    break;
                 }
             }
         }
@@ -88,19 +106,22 @@ namespace DvMod.RemoteDispatch
             switch (request.Url.Segments[1].TrimEnd('/'))
             {
             case "car":
-                HandleCarRequest(context);
+                await HandleCarRequest(context).ConfigureAwait(false);
                 break;
             case "job":
-                Render200(context, ContentTypes.Json, JobData.GetAllJobDataJson());
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    JobData.GetAllJobDataJson).ConfigureAwait(false));
                 break;
             case "junction":
-                HandleJunctionRequest(context);
+                await HandleJunctionRequest(context).ConfigureAwait(false);
                 break;
             case "junctionState":
-                Render200(context, ContentTypes.Json, Junctions.GetJunctionStateJSON());
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    Junctions.GetJunctionStateJSON).ConfigureAwait(false));
                 break;
             case "player":
-                var playerJson = PlayerData.GetPlayerDataJson();
+                var playerJson = await Updater.RunOnMainThread(
+                    PlayerData.GetPlayerDataJson).ConfigureAwait(false);
                 if (playerJson != null)
                     Render200(context, ContentTypes.Json, playerJson);
                 else
@@ -119,17 +140,19 @@ namespace DvMod.RemoteDispatch
                 break;
             }
             case "currentTrain":
-                Render200(context, ContentTypes.Json,
-                    CurrentTrain.GetCurrentTrainJson().ToString(Formatting.None));
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(() =>
+                    CurrentTrain.GetCurrentTrainJson().ToString(Formatting.None)).ConfigureAwait(false));
                 break;
             case "route":
-                HandleRouteRequest(context);
+                await HandleRouteRequest(context).ConfigureAwait(false);
                 break;
             case "station":
-                Render200(context, ContentTypes.Json, Stations.GetStationJSON());
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    Stations.GetStationJSON).ConfigureAwait(false));
                 break;
             case "track":
-                Render200(context, ContentTypes.Json, await RailTracks.GetTrackPointJSON().ConfigureAwait(false));
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(() =>
+                    RailTracks.GetTrackPointJSON().GetAwaiter().GetResult()).ConfigureAwait(false));
                 break;
             case "trainset":
                 HandleTrainsetRequest(context);
@@ -143,7 +166,7 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        private static async void HandleCarRequest(HttpListenerContext context)
+        private static async Task HandleCarRequest(HttpListenerContext context)
         {
             var segments = context.Request.Url.Segments;
             if (segments.Length == 2 && context.Request.HttpMethod == "GET")
@@ -182,6 +205,7 @@ namespace DvMod.RemoteDispatch
                     LocoControl.RunCommand(controller, context.Request.QueryString)
                 ).ConfigureAwait(false);
                 RenderEmpty(context, success ? 204 : 400);
+                return;
             }
             RenderEmpty(context, 404);
         }
@@ -207,14 +231,15 @@ namespace DvMod.RemoteDispatch
         /// GET  /route                       list active routes
         /// POST /route/{trainsetId}/{trackId} plan and set a route
         /// POST /route/{routeId}/clear        release a route and its junctions
-        private static async void HandleRouteRequest(HttpListenerContext context)
+        private static async Task HandleRouteRequest(HttpListenerContext context)
         {
             var url = context.Request.Url;
             var segments = url.Segments;
 
             if (segments.Length == 2 && context.Request.HttpMethod == "GET")
             {
-                Render200(context, ContentTypes.Json, Routing.AllRoutesJson());
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    Routing.AllRoutesJson).ConfigureAwait(false));
                 return;
             }
 
@@ -233,8 +258,12 @@ namespace DvMod.RemoteDispatch
 
                 if (second == "clear")
                 {
-                    await Updater.RunOnMainThread(() => Routing.ClearRoute(first)).ConfigureAwait(false);
-                    Render200(context, ContentTypes.Json, Routing.AllRoutesJson());
+                    var routesJson = await Updater.RunOnMainThread(() =>
+                    {
+                        Routing.ClearRoute(first);
+                        return Routing.AllRoutesJson();
+                    }).ConfigureAwait(false);
+                    Render200(context, ContentTypes.Json, routesJson);
                     return;
                 }
 
@@ -282,13 +311,14 @@ namespace DvMod.RemoteDispatch
             return null;
         }
 
-        private static async void HandleJunctionRequest(HttpListenerContext context)
+        private static async Task HandleJunctionRequest(HttpListenerContext context)
         {
             var url = context.Request.Url;
             switch (url.Segments.Length)
             {
             case 2:
-                Render200(context, ContentTypes.Json, Junctions.GetJunctionPointJSON());
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    Junctions.GetJunctionPointJSON).ConfigureAwait(false));
                 break;
             case 4:
                 var junctionIdString = url.Segments[2].TrimEnd('/');
@@ -325,7 +355,12 @@ namespace DvMod.RemoteDispatch
                 RenderEmpty(context, 404);
                 return;
             }
-            var trainsetId = int.Parse(request.Url.Segments[2]);
+            var trainsetIdText = request.Url.Segments[2].TrimEnd('/');
+            if (!int.TryParse(trainsetIdText, out var trainsetId))
+            {
+                RenderEmpty(context, 404);
+                return;
+            }
             Render200(context, CarData.GetTrainsetDataJson(trainsetId));
         }
 
@@ -350,6 +385,11 @@ namespace DvMod.RemoteDispatch
 
         private static void RenderResource(HttpListenerContext context)
         {
+            if (context.Request.Url.Segments.Length < 3)
+            {
+                RenderEmpty(context, 404);
+                return;
+            }
             var resourceName = context.Request.Url.Segments[2];
             var extension = Path.GetExtension(resourceName);
             context.Response.ContentType = ContentTypes.ForExtension(extension);

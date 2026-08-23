@@ -1,28 +1,27 @@
 using System.Collections.Generic;
 using System.Linq;
+using Signals.Game;
+using Signals.Game.Controllers;
+using Signals.Game.Railway;
 using UnityEngine;
 
 namespace DvMod.RemoteDispatch
 {
-    /// Three-position colour light aspects.
+    /// Compact HUD representation of the aspect supplied by DV Signals.
     public enum Aspect
     {
-        Clear,      // green  - line clear for at least two blocks
-        Caution,    // amber  - next block clear, the one beyond is not
-        Stop,       // red    - next block occupied
-        Unknown,    // no line ahead to read (buffer stop, or not on track)
+        Clear,              // green          - all three blocks clear
+        PreliminaryCaution, // flashing amber - stop aspect is two signals ahead
+        Caution,            // steady amber   - next signal is at stop
+        Stop,               // red            - next protected block occupied
+        Unknown,            // no line ahead to read (buffer stop, or not on track)
     }
 
-    /// Block occupancy ahead of a train, and the speed the road ahead will take.
-    ///
-    /// A block here is one RailTrack: DV has no signalling of its own, and track
-    /// is already divided at every junction, which is where a real block would
-    /// end anyway.
+    /// DV Signals is authoritative for physical signals, blocks, occupation,
+    /// junction paths and reservations. This class only finds the signal ahead
+    /// of a train and translates its live aspect for the CSA HUD.
     public static class Signalling
     {
-        /// How far ahead to read, in blocks, and the distance over which the
-        /// speed of the road ahead is judged.
-        public const int BlocksToRead = 2;
         public const float SpeedLookaheadMeters = 400f;
 
         /// Standard sign values, so the readout matches the numbers a driver
@@ -38,18 +37,23 @@ namespace DvMod.RemoteDispatch
             public readonly Aspect aspect;
             public readonly int speedLimitKph;
             public readonly string blockAhead;
+            public readonly float approachingDistanceMeters;
 
-            public Reading(Aspect aspect, int speedLimitKph, string blockAhead)
+            public Reading(Aspect aspect, int speedLimitKph, string blockAhead,
+                float approachingDistanceMeters = -1f)
             {
                 this.aspect = aspect;
                 this.speedLimitKph = speedLimitKph;
                 this.blockAhead = blockAhead;
+                this.approachingDistanceMeters = approachingDistanceMeters;
             }
         }
 
         /// Remembered direction of travel, so the aspect does not flip to the
         /// other end of the train the moment it stops.
         private static readonly Dictionary<int, Vector3> lastHeadings = new Dictionary<int, Vector3>();
+
+        public static void Reset() => lastHeadings.Clear();
 
         /// Read the line ahead of the train the player is in.
         public static Reading ReadForPlayer()
@@ -75,16 +79,53 @@ namespace DvMod.RemoteDispatch
             if (start == null)
                 return new Reading(Aspect.Unknown, 0, "");
 
-            var ahead = BlocksAhead(start.Value, BlocksToRead + 1);
-            var aspect = AspectFor(start.Value, ahead, ownTrainsetId);
+            var aspect = Aspect.Unknown;
+            var approachingDistance = -1f;
+            var blockAhead = "";
+            ReadDvSignal(start.Value, leadCar.transform.position,
+                out aspect, out approachingDistance, out blockAhead);
 
             // Prefer the limit the game actually posts; fall back to the figure
-            // derived from curvature only where no sign has been passed.
+            // derived from curvature only for the initial block. SpeedSigns
+            // latches either value until the leading end crosses another sign.
             SpeedSigns.ScanIfDue();
-            var posted = SpeedSigns.LimitAt(car.transform.position, heading);
-            var speed = posted ?? SpeedLimitFor(start.Value);
-            var blockAhead = ahead.Count > 0 ? DescribeTrack(ahead[0].track) : "";
-            return new Reading(aspect, speed, blockAhead);
+            var speed = SpeedSigns.LimitAt(
+                ownTrainsetId, leadCar, heading, SpeedLimitFor(start.Value));
+            return new Reading(aspect, speed, blockAhead, approachingDistance);
+        }
+
+        private static void ReadDvSignal(TrackGraph.Step start, Vector3 position,
+            out Aspect aspect, out float distance, out string signalName)
+        {
+            aspect = Aspect.Unknown;
+            distance = -1f;
+            signalName = "";
+            if (!SignalManager.Running)
+                return;
+
+            var direction = start.enteredViaIn ? TrackDirection.Out : TrackDirection.In;
+            TrackWalker.GetTracksUntilMainSignal(start.track, direction, out var info);
+            var controller = info.Signal;
+            var signal = controller?.GetControllerSignal();
+            var current = signal?.CurrentAspect;
+            if (controller == null || signal == null || current == null)
+                return;
+
+            signalName = controller.Name;
+            distance = Vector3.Distance(position, controller.Position);
+            if (current.DisallowPassing)
+            {
+                aspect = Aspect.Stop;
+                return;
+            }
+
+            // DV Signals orders a signal's aspects from most to least
+            // restrictive. Preserve its decision; this is only a reduction to
+            // the three-lamp CSA HUD, not a second occupancy calculation.
+            var remaining = signal.AllAspects.Length - 1 - signal.CurrentAspectIndex;
+            aspect = remaining <= 0 ? Aspect.Clear
+                : remaining == 1 ? Aspect.Caution
+                : Aspect.PreliminaryCaution;
         }
 
         /// Direction the driver has selected, from the reverser, or zero when it
@@ -185,57 +226,6 @@ namespace DvMod.RemoteDispatch
             var along = curve[curve.pointCount - 1].position - curve[0].position;
             var forward = Vector3.Dot(new Vector3(along.x, 0, along.z), heading) >= 0f;
             return new TrackGraph.Step(track, forward);
-        }
-
-        /// Walk the line the switches are actually set for, which is where the
-        /// train will go, rather than every branch it could take.
-        public static List<TrackGraph.Step> BlocksAhead(TrackGraph.Step start, int count)
-        {
-            var blocks = new List<TrackGraph.Step>();
-            var current = start;
-            var visited = new HashSet<RailTrack> { start.track };
-
-            for (var i = 0; i < count; i++)
-            {
-                var branch = current.enteredViaIn
-                    ? current.track.GetOutBranch()
-                    : current.track.GetInBranch();
-                if (branch == null || branch.track == null || !visited.Add(branch.track))
-                    break;
-                var next = new TrackGraph.Step(branch.track, branch.first);
-                blocks.Add(next);
-                current = next;
-            }
-            return blocks;
-        }
-
-        private static Aspect AspectFor(TrackGraph.Step current, List<TrackGraph.Step> ahead, int ownTrainsetId)
-        {
-            // Foreign cars standing on the track the train is already running
-            // along are the closest hazard there is, and used to be missed
-            // entirely because only subsequent blocks were examined.
-            if (IsOccupied(current.track, ownTrainsetId))
-                return Aspect.Stop;
-            if (ahead.Count == 0)
-                return Aspect.Unknown;
-            if (IsOccupied(ahead[0].track, ownTrainsetId))
-                return Aspect.Stop;
-            if (ahead.Count > 1 && IsOccupied(ahead[1].track, ownTrainsetId))
-                return Aspect.Caution;
-            return Aspect.Clear;
-        }
-
-        private static bool IsOccupied(RailTrack track, int ownTrainsetId)
-        {
-            foreach (var position in Occupancy.AllCarPositions())
-            {
-                if (position.track != track)
-                    continue;
-                var trainset = position.car.trainset;
-                if (trainset == null || trainset.id != ownTrainsetId)
-                    return true;
-            }
-            return false;
         }
 
         /// Speed the road ahead will take, derived from how sharply it curves.

@@ -19,27 +19,44 @@ namespace DvMod.RemoteDispatch
             public readonly Vector3 position;
             public readonly Vector3 facing;
             public readonly int kph;
+            public readonly RailTrack track;
+            public readonly float trackPosition;
 
-            public Sign(Vector3 position, Vector3 facing, int kph)
+            public Sign(Vector3 position, Vector3 facing, int kph, RailTrack track, float trackPosition)
             {
                 this.position = position;
                 this.facing = facing;
                 this.kph = kph;
+                this.track = track;
+                this.trackPosition = trackPosition;
             }
         }
 
         /// Signs stream in and out with the world, so they are accumulated as
         /// they are seen rather than scanned once, keyed by rounded position so
         /// the same sign is not stored twice.
+        private sealed class TrainState
+        {
+            public TrainCar leadCar = null!;
+            public RailTrack track = null!;
+            public float trackPosition;
+            public int limit;
+        }
+
         private static readonly Dictionary<Vector3Int, Sign> known = new Dictionary<Vector3Int, Sign>();
+        private static readonly Dictionary<int, TrainState> trainStates = new Dictionary<int, TrainState>();
         private static float nextScanTime;
 
         public const float RescanSeconds = 5f;
-        /// How far back a passed sign still governs. Beyond this the limit is
-        /// treated as unknown rather than reported from a sign long gone.
-        public const float MaxDistanceBehind = 4000f;
 
         public static int KnownCount => known.Count;
+
+        public static void Reset()
+        {
+            known.Clear();
+            trainStates.Clear();
+            nextScanTime = 0f;
+        }
 
         public static void ScanIfDue()
         {
@@ -51,6 +68,7 @@ namespace DvMod.RemoteDispatch
 
         public static void Scan()
         {
+            var tracks = Object.FindObjectsOfType<RailTrack>();
             foreach (var data in Object.FindObjectsOfType<SignGeneratorData>())
             {
                 if (data == null || data.signParameters == null)
@@ -68,7 +86,11 @@ namespace DvMod.RemoteDispatch
                         Mathf.RoundToInt(position.x),
                         Mathf.RoundToInt(position.y),
                         Mathf.RoundToInt(position.z));
-                    known[key] = new Sign(position, transform.forward, kph);
+                    if (known.ContainsKey(key))
+                        continue;
+                    if (!NearestTrack(position, transform.forward, tracks, out var track, out var trackPosition))
+                        continue;
+                    known[key] = new Sign(position, transform.forward, kph, track, trackPosition);
                 }
             }
         }
@@ -95,63 +117,193 @@ namespace DvMod.RemoteDispatch
             return kph > 0 && kph <= 200;
         }
 
-        /// The limit in force at a position for a train travelling `heading`.
+        /// The limit in force for a train travelling `heading`.
         ///
         /// Signs divide the line into zones: a limit applies from the sign that
         /// posts it until the next one, so the governing sign is the nearest one
-        /// already passed. Signs facing the other way belong to the opposite
-        /// direction, and signs set well off to the side belong to a parallel
-        /// line, so both are skipped - but if that leaves nothing, the nearest
-        /// passed sign is used anyway rather than reporting no limit at all.
-        public static int? LimitAt(Vector3 position, Vector3 heading)
+        /// already passed. Each sign is bound to its nearest physical track, so
+        /// neighbouring station roads cannot change the limit. Once selected,
+        /// the value persists across track boundaries until another sign is
+        /// actually passed.
+        public static int LimitAt(int trainsetId, TrainCar? leadCar, Vector3 heading, int initialLimit)
         {
+            trainStates.TryGetValue(trainsetId, out var state);
+            if (leadCar == null)
+                return state?.limit ?? initialLimit;
+            var bogie = leadCar.Bogies?.FirstOrDefault(b => b != null && b.track != null);
+            if (bogie == null)
+                return state?.limit ?? initialLimit;
+
+            var position = leadCar.transform.position;
             var flatHeading = new Vector3(heading.x, 0, heading.z);
             if (flatHeading.sqrMagnitude < 0.0001f || known.Count == 0)
-                return null;
+                return state?.limit ?? initialLimit;
             flatHeading = flatHeading.normalized;
 
-            var bestFacing = float.MaxValue;
-            int? facingLimit = null;
-            var bestAny = float.MaxValue;
-            int? anyLimit = null;
+            if (!ProjectOntoTrack(position, bogie.track, out var trainPosition, out _))
+                return state?.limit ?? initialLimit;
 
-            foreach (var sign in known.Values)
+            if (state == null)
             {
-                var toTrain = position - sign.position;
-                toTrain.y = 0;
-                var behind = Vector3.Dot(toTrain, flatHeading);
-                if (behind < 0f || behind > MaxDistanceBehind)
-                    continue;   // not reached yet, or too far back to still apply
-
-                var lateral = (toTrain - flatHeading * behind).magnitude;
-                if (lateral > MaxLateralMeters)
-                    continue;   // belongs to a line running alongside this one
-
-                if (behind < bestAny)
+                state = new TrainState
                 {
-                    bestAny = behind;
-                    anyLimit = sign.kph;
-                }
-
-                // A sign posted for this direction faces the traffic reading it,
-                // so its forward points back along the way the train is going.
-                var facing = new Vector3(sign.facing.x, 0, sign.facing.z);
-                if (facing.sqrMagnitude > 0.0001f
-                    && Vector3.Dot(facing.normalized, flatHeading) > 0.3f)
-                    continue;
-
-                if (behind < bestFacing)
-                {
-                    bestFacing = behind;
-                    facingLimit = sign.kph;
-                }
+                    leadCar = leadCar,
+                    track = bogie.track,
+                    trackPosition = trainPosition,
+                    limit = InitialLimit(bogie.track, trainPosition, flatHeading) ?? initialLimit,
+                };
+                if (trainsetId >= 0)
+                    trainStates[trainsetId] = state;
+                return state.limit;
             }
 
-            return facingLimit ?? anyLimit;
+            // Entering another RailTrack does not define a new speed block. Keep
+            // the current limit and establish a new crossing baseline there.
+            if (state.leadCar != leadCar || state.track != bogie.track)
+            {
+                state.leadCar = leadCar;
+                state.track = bogie.track;
+                state.trackPosition = trainPosition;
+                return state.limit;
+            }
+
+            var movement = trainPosition - state.trackPosition;
+            if (Mathf.Abs(movement) < MinimumMovementMeters)
+                return state.limit;
+
+            Sign? lastCrossed = null;
+            foreach (var sign in known.Values)
+            {
+                if (sign.track != bogie.track || !FacesTrain(sign, flatHeading))
+                    continue;
+
+                var crossed = movement > 0f
+                    ? sign.trackPosition > state.trackPosition + CrossingToleranceMeters
+                        && sign.trackPosition <= trainPosition + CrossingToleranceMeters
+                    : sign.trackPosition < state.trackPosition - CrossingToleranceMeters
+                        && sign.trackPosition >= trainPosition - CrossingToleranceMeters;
+                if (!crossed)
+                    continue;
+
+                // If more than one sign was crossed between UI updates, the last
+                // one in the direction of travel defines the new block.
+                if (!lastCrossed.HasValue
+                    || (movement > 0f && sign.trackPosition > lastCrossed.Value.trackPosition)
+                    || (movement < 0f && sign.trackPosition < lastCrossed.Value.trackPosition))
+                    lastCrossed = sign;
+            }
+
+            state.trackPosition = trainPosition;
+            if (lastCrossed.HasValue)
+                state.limit = lastCrossed.Value.kph;
+            return state.limit;
         }
 
-        /// How far to the side a sign may sit and still be read as governing
-        /// this line.
-        public const float MaxLateralMeters = 40f;
+        private static int? InitialLimit(RailTrack track, float trainPosition, Vector3 heading)
+        {
+            var increasing = TrackDirectionAt(track, trainPosition, heading);
+            var nearestPassed = float.MaxValue;
+            int? result = null;
+            foreach (var sign in known.Values)
+            {
+                if (sign.track != track || !FacesTrain(sign, heading))
+                    continue;
+                var passed = increasing
+                    ? trainPosition - sign.trackPosition
+                    : sign.trackPosition - trainPosition;
+                if (passed < 0f || passed >= nearestPassed)
+                    continue;
+                nearestPassed = passed;
+                result = sign.kph;
+            }
+            return result;
+        }
+
+        private static bool FacesTrain(Sign sign, Vector3 heading)
+        {
+            var facing = new Vector3(sign.facing.x, 0f, sign.facing.z);
+            return facing.sqrMagnitude < 0.0001f
+                || Vector3.Dot(facing.normalized, heading) <= 0.3f;
+        }
+
+        private const float TrackAssignmentMeters = 6f;
+        private const float MinimumMovementMeters = 0.05f;
+        private const float CrossingToleranceMeters = 0.1f;
+        private const int CurveSamples = 32;
+
+        private static bool NearestTrack(Vector3 position, Vector3 signFacing, RailTrack[] tracks,
+            out RailTrack nearest, out float trackPosition)
+        {
+            nearest = null!;
+            trackPosition = 0f;
+            var best = TrackAssignmentMeters;
+            foreach (var track in tracks)
+            {
+                if (!ProjectOntoTrack(position, track, out var along, out var distance) || distance >= best)
+                    continue;
+                var tangent = TangentAt(track, along);
+                var facing = new Vector3(signFacing.x, 0f, signFacing.z);
+                if (tangent.sqrMagnitude < 0.0001f || facing.sqrMagnitude < 0.0001f
+                    || Mathf.Abs(Vector3.Dot(tangent.normalized, facing.normalized)) < MinimumTrackAlignment)
+                    continue;
+                best = distance;
+                nearest = track;
+                trackPosition = along;
+            }
+            return nearest != null;
+        }
+
+        private static bool ProjectOntoTrack(Vector3 position, RailTrack track,
+            out float along, out float distance)
+        {
+            along = 0f;
+            distance = float.MaxValue;
+            var curve = track == null ? null : track.curve;
+            if (curve == null || curve.pointCount < 2)
+                return false;
+
+            var flatPosition = new Vector3(position.x, 0f, position.z);
+            var previous = curve.GetPointAt(0f);
+            previous.y = 0f;
+            var travelled = 0f;
+            for (var i = 1; i <= CurveSamples; i++)
+            {
+                var current = curve.GetPointAt((float)i / CurveSamples);
+                current.y = 0f;
+                var segment = current - previous;
+                var length = segment.magnitude;
+                if (length > 0.001f)
+                {
+                    var fraction = Mathf.Clamp01(Vector3.Dot(flatPosition - previous, segment) / (length * length));
+                    var projected = previous + segment * fraction;
+                    var candidate = Vector3.Distance(flatPosition, projected);
+                    if (candidate < distance)
+                    {
+                        distance = candidate;
+                        along = travelled + length * fraction;
+                    }
+                }
+                travelled += length;
+                previous = current;
+            }
+            return distance < float.MaxValue;
+        }
+
+        private static bool TrackDirectionAt(RailTrack track, float along, Vector3 heading)
+            => Vector3.Dot(TangentAt(track, along), heading) >= 0f;
+
+        private static Vector3 TangentAt(RailTrack track, float along)
+        {
+            var length = Mathf.Max(1f, TrackGraph.TrackLength(track));
+            var t = Mathf.Clamp01(along / length);
+            var delta = 1f / CurveSamples;
+            var before = track.curve.GetPointAt(Mathf.Clamp01(t - delta));
+            var after = track.curve.GetPointAt(Mathf.Clamp01(t + delta));
+            var tangent = after - before;
+            tangent.y = 0f;
+            return tangent;
+        }
+
+        private const float MinimumTrackAlignment = 0.75f;
     }
 }

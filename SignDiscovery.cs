@@ -83,7 +83,7 @@ namespace DvMod.RemoteDispatch
                 var property = child.GetType().GetProperty("text");
                 if (property == null || property.PropertyType != typeof(string))
                     continue;
-                string value;
+                string? value;
                 try
                 {
                     value = property.GetValue(child, null) as string;
@@ -92,7 +92,7 @@ namespace DvMod.RemoteDispatch
                 {
                     continue;
                 }
-                if (!string.IsNullOrEmpty(value))
+                if (value != null && value.Length > 0)
                     yield return child.GetType().Name + "=" + value.Trim();
             }
         }
@@ -108,7 +108,7 @@ namespace DvMod.RemoteDispatch
             {
                 if (field.FieldType != typeof(int) && field.FieldType != typeof(float))
                     continue;
-                object value;
+                object? value;
                 try
                 {
                     value = field.GetValue(behaviour);
@@ -117,7 +117,8 @@ namespace DvMod.RemoteDispatch
                 {
                     continue;
                 }
-                yield return field.Name + "=" + value;
+                if (value != null)
+                    yield return field.Name + "=" + value;
             }
         }
     }
