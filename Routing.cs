@@ -33,6 +33,7 @@ namespace DvMod.RemoteDispatch
         public int rightDivergences;
         public List<RailTrack> pathTracks = new List<RailTrack>();
         public int progressIndex;   // path entries before this are behind the train
+        public int releasedUpTo;    // junctions handed back, never re-taken
     }
 
     /// Route planning and safe junction setting.
@@ -188,8 +189,8 @@ namespace DvMod.RemoteDispatch
                 destinationTrackId = destinationTrackId,
             };
 
-            var start = StartStepFor(trainset);
-            if (start == null)
+            var candidates = StartCandidates(trainset).ToList();
+            if (candidates.Count == 0)
             {
                 route.status = RouteStatus.Failed;
                 route.message = "Could not determine which track the train is on.";
@@ -197,43 +198,51 @@ namespace DvMod.RemoteDispatch
                 return route;
             }
 
-            route.priority = PriorityFor(start.Value.track);
-
-            // Search the way the train faces first. If nothing is reachable that
-            // way the train can still reverse, so try the opposite direction
-            // rather than reporting no route at all.
-            var goals = new HashSet<RailTrack> { destination };
-            var path = TrackGraph.FindPath(start.Value, goals, extraCost: RightHandPenalty);
-            var reversed = false;
-            if (path == null)
+            // The consist occupies several tracks; a road that immediately runs
+            // back through the train itself is not usable.
+            var occupied = new HashSet<RailTrack>();
+            foreach (var position in Occupancy.AllCarPositions())
             {
-                var behind = new TrackGraph.Step(start.Value.track, !start.Value.enteredViaIn);
-                path = TrackGraph.FindPath(behind, goals, extraCost: RightHandPenalty);
-                reversed = path != null;
+                var set = position.car.trainset;
+                if (set != null && set.id == trainset.id)
+                    occupied.Add(position.track);
+            }
+
+            var goals = new HashSet<RailTrack> { destination };
+            List<TrackGraph.Step>? path = null;
+            var chosen = candidates[0];
+
+            // Candidates are ordered with the outward direction of each end
+            // first, so a pull is tried before the equivalent propelling move.
+            foreach (var candidate in candidates)
+            {
+                var found = TrackGraph.FindPath(candidate, goals, extraCost: RightHandPenalty);
+                if (found == null)
+                    continue;
+                if (path == null || PathLength(found) < PathLength(path))
+                {
+                    path = found;
+                    chosen = candidate;
+                }
             }
 
             if (path == null)
             {
+                var reach = candidates.Select(c => TrackGraph.CountReachable(c)).ToList();
                 route.status = RouteStatus.Failed;
-                var forwardReach = TrackGraph.CountReachable(start.Value);
-                var backwardReach = TrackGraph.CountReachable(
-                    new TrackGraph.Step(start.Value.track, !start.Value.enteredViaIn));
                 route.message = "No route found to " + DescribeTrack(destination)
-                    + " from " + DescribeTrack(start.Value.track)
-                    + " (reachable states: " + forwardReach + " ahead, "
-                    + backwardReach + " behind).";
+                    + " from " + DescribeTrack(candidates[0].track)
+                    + " (reachable states: " + string.Join(", ", reach) + ").";
                 routes[route.id] = route;
                 return route;
             }
-            route.requiresReverse = reversed;
 
-            // FullDisplayID, matching both the /track keys the map draws with and
-            // the IDs the game prints on jobs.
-            route.trackIds = path
-                .Select(step => step.track.LogicTrack())
-                .Where(track => track != null)
-                .Select(track => track.ID.FullDisplayID)
-                .ToList();
+            route.priority = PriorityFor(chosen.track);
+            // The road leaves from the end of the consist that this path starts
+            // at; if that is not the end the locomotive faces, the train is
+            // propelling rather than pulling.
+            route.requiresReverse = !occupied.Contains(chosen.track) || IsPropelling(trainset, chosen);
+
             route.pathTracks = path.Select(step => step.track).ToList();
             route.settings = SettingsForPath(path);
             CountDivergences(path, route);
@@ -357,11 +366,11 @@ namespace DvMod.RemoteDispatch
             var divergences = route.leftDivergences + route.rightDivergences > 0
                 ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
                 : "";
-            var prefix = route.requiresReverse ? "Route set (train must reverse). " : "";
+            var prefix = route.requiresReverse ? "Route set, train propels (cars lead). " : "";
             route.message = route.pending.Count > 0
                 ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
                 : (route.requiresReverse
-                    ? "Route set" + divergences + " - train must reverse to follow it."
+                    ? "Route set" + divergences + " - train propels, cars lead."
                     : "Route set" + divergences + ".");
         }
 
@@ -386,8 +395,11 @@ namespace DvMod.RemoteDispatch
             if (occupied.Count == 0)
                 return;
 
+            // Scan the whole path, not just from the last known point: a train
+            // that backs up along its road should light the track behind it
+            // again rather than leaving it cleared.
             var rearmost = -1;
-            for (var i = route.progressIndex; i < route.pathTracks.Count; i++)
+            for (var i = 0; i < route.pathTracks.Count; i++)
             {
                 if (occupied.Contains(route.pathTracks[i]))
                 {
@@ -395,28 +407,34 @@ namespace DvMod.RemoteDispatch
                     break;
                 }
             }
-            if (rearmost <= route.progressIndex)
-                return;
+            if (rearmost < 0)
+                return;   // off its road entirely; leave the route as it stands
 
+            var moved = rearmost != route.progressIndex;
             route.progressIndex = rearmost;
 
-            // Hand back the junctions now behind the train.
-            foreach (var setting in route.settings.Where(s => s.pathIndex < rearmost))
+            // Junctions are handed back only as the train clears them for good.
+            // Releasing and re-taking them as it shuffles back and forth would
+            // let another route claim one mid-manoeuvre.
+            if (rearmost > route.releasedUpTo)
             {
-                if (reservations.TryGetValue(setting.junction, out var owner) && owner == route.id)
-                    reservations.Remove(setting.junction);
-                route.pending.Remove(setting.junction);
+                foreach (var setting in route.settings.Where(x => x.pathIndex < rearmost))
+                {
+                    if (reservations.TryGetValue(setting.junction, out var owner) && owner == route.id)
+                        reservations.Remove(setting.junction);
+                    route.pending.Remove(setting.junction);
+                }
+                route.releasedUpTo = rearmost;
             }
 
-            // Arrived: the whole road has been run.
             if (route.progressIndex >= route.pathTracks.Count - 1)
             {
-                route.status = RouteStatus.Cleared;
                 route.message = "Arrived at " + route.destinationTrackId + ".";
                 ClearRoute(route.id);
                 return;
             }
-            Sessions.AddTag("routes");
+            if (moved)
+                Sessions.AddTag("routes");
         }
 
         /// Retry deferred junctions. Driven by Updater so it shares the mod's
@@ -454,30 +472,99 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        private static TrackGraph.Step? StartStepFor(Trainset trainset)
+        /// Candidate starting points for a route: the outward direction from
+        /// each end of the consist.
+        ///
+        /// Which end leads cannot be read from the locomotive. A loco propelling
+        /// its cars faces backwards along the direction of travel, and may sit
+        /// anywhere in the consist, so routing from the loco would set the road
+        /// out from the wrong end. Both ends are offered and the search picks
+        /// whichever actually reaches the destination.
+        private static IEnumerable<TrackGraph.Step> StartCandidates(Trainset trainset)
         {
-            var cars = trainset == null ? null : trainset.cars;
+            var cars = trainset?.cars;
             if (cars == null || cars.Count == 0)
-                return null;
-            // Prefer a locomotive; otherwise take any car with a bogie on track.
-            var car = cars.FirstOrDefault(c => c != null && c.IsLoco) ?? cars.FirstOrDefault(c => c != null);
-            if (car == null)
-                return null;
-            var bogie = car.Bogies?.FirstOrDefault(b => b != null && b.track != null);
-            if (bogie == null)
-                return null;
-            // Which end we leave by follows the direction the train faces.
-            var forward = car.transform.forward;
-            var curve = bogie.track.curve;
-            var enteredViaIn = true;
-            if (curve != null && curve.pointCount >= 2)
+                yield break;
+
+            var first = trainset!.firstCar;
+            var last = trainset.lastCar;
+            var seen = new HashSet<TrackGraph.Step>();
+
+            foreach (var end in new[] { first, last })
             {
-                var along = curve.Last().position - curve[0].position;
-                enteredViaIn = Vector3.Dot(
-                    new Vector3(along.x, 0, along.z),
-                    new Vector3(forward.x, 0, forward.z)) >= 0f;
+                if (end == null)
+                    continue;
+                var bogie = end.Bogies?.FirstOrDefault(b => b != null && b.track != null);
+                if (bogie == null)
+                    continue;
+
+                // Point away from the far end of the consist. With one car there
+                // is no "away", so both directions are offered instead.
+                var other = end == first ? last : first;
+                var away = other == null || other == end
+                    ? Vector3.zero
+                    : end.transform.position - other.transform.position;
+
+                foreach (var step in StepsFrom(bogie.track, away))
+                {
+                    if (seen.Add(step))
+                        yield return step;
+                }
             }
-            return new TrackGraph.Step(bogie.track, enteredViaIn);
+        }
+
+        /// Steps leaving a track, ordered so the one heading `away` comes first.
+        /// A zero `away` yields both directions.
+        private static IEnumerable<TrackGraph.Step> StepsFrom(RailTrack track, Vector3 away)
+        {
+            var forward = new TrackGraph.Step(track, true);
+            var backward = new TrackGraph.Step(track, false);
+
+            if (away.sqrMagnitude < 0.0001f)
+            {
+                yield return forward;
+                yield return backward;
+                yield break;
+            }
+
+            // Exit tangent of each direction, compared against the outward vector.
+            var forwardTangent = TangentAtEnd(track, atInEnd: false, leaving: true);
+            var flat = new Vector3(away.x, 0, away.z);
+            var alignsForward = Vector3.Dot(
+                new Vector3(forwardTangent.x, 0, forwardTangent.z), flat) >= 0f;
+
+            if (alignsForward)
+            {
+                yield return forward;
+                yield return backward;
+            }
+            else
+            {
+                yield return backward;
+                yield return forward;
+            }
+        }
+
+        private static float PathLength(List<TrackGraph.Step> path)
+        {
+            var total = 0f;
+            foreach (var step in path)
+                total += TrackGraph.TrackLength(step.track);
+            return total;
+        }
+
+        /// True when the road leaves the consist in the direction the leading
+        /// locomotive faces away from, meaning the train pushes rather than pulls.
+        private static bool IsPropelling(Trainset trainset, TrackGraph.Step start)
+        {
+            var loco = trainset.cars?.FirstOrDefault(c => c != null && c.IsLoco);
+            if (loco == null)
+                return false;
+            var departure = TangentAtEnd(start.track, atInEnd: !start.enteredViaIn, leaving: true);
+            var facing = loco.transform.forward;
+            return Vector3.Dot(
+                new Vector3(departure.x, 0, departure.z),
+                new Vector3(facing.x, 0, facing.z)) < 0f;
         }
 
         private static string DescribeTrack(RailTrack track)
