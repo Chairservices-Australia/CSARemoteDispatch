@@ -31,6 +31,7 @@ namespace DvMod.RemoteDispatch
         public bool requiresReverse;
         public int leftDivergences;
         public int rightDivergences;
+        public float distanceMeters;
         public JArray divergenceDetail = new JArray();
         public List<RailTrack> pathTracks = new List<RailTrack>();
         public int progressIndex;   // path entries before this are behind the train
@@ -298,24 +299,23 @@ namespace DvMod.RemoteDispatch
                 goals.Add(destination);
             List<TrackGraph.Step>? path = null;
             var chosen = candidates[0];
-            var fewestRightTurns = int.MaxValue;
             var shortestLength = float.MaxValue;
 
-            // Candidates are ordered with the outward direction of each end
-            // first, so a pull is tried before the equivalent propelling move.
+            // Every connected track is traversable, including tracks belonging
+            // to intermediate stations and yards. The selected destination is
+            // the only terminal condition. Choose the physically shortest road
+            // from either end of the consist; junction side is diagnostic only
+            // and must not force a train onto a longer route.
             foreach (var candidate in candidates)
             {
-                var found = TrackGraph.FindPath(candidate, goals, extraCost: RightHandPenalty);
+                var found = TrackGraph.FindPath(candidate, goals);
                 if (found == null)
                     continue;
-                var rightTurns = CountRightHandChoices(found);
                 var length = PathLength(found);
-                if (path == null || rightTurns < fewestRightTurns
-                    || (rightTurns == fewestRightTurns && length < shortestLength))
+                if (path == null || length < shortestLength)
                 {
                     path = found;
                     chosen = candidate;
-                    fewestRightTurns = rightTurns;
                     shortestLength = length;
                 }
             }
@@ -332,6 +332,7 @@ namespace DvMod.RemoteDispatch
             }
 
             route.priority = PriorityFor(chosen.track);
+            route.distanceMeters = shortestLength;
             // The road leaves from the end of the consist that this path starts
             // at; if that is not the end the locomotive faces, the train is
             // propelling rather than pulling.
@@ -366,21 +367,12 @@ namespace DvMod.RemoteDispatch
             return route;
         }
 
-        /// Cost charged for taking a right-hand branch where a left one exists.
-        ///
-        /// Larger than any total path length the world can produce, so a road
-        /// with fewer right-hand turns always beats one with more no matter how
-        /// much longer it is. That gives "always left where possible" without
-        /// forbidding the move outright: an outright ban makes the destination
-        /// unreachable wherever a left branch dead-ends, and the search then
-        /// abandons left-hand running for the whole journey rather than for the
-        /// one junction that needed it.
-        public const float RightHandCost = 1000000f;
-
-        private static float RightHandPenalty(TrackGraph.Step from, TrackGraph.Step to)
+        /// Reports whether a path takes the right-hand option. This no longer
+        /// affects route cost: the quickest/shortest connected road wins.
+        private static bool IsRightHandChoice(TrackGraph.Step from, TrackGraph.Step to)
         {
             if (!IsFacingChoice(from, out var junction))
-                return 0f;
+                return false;
 
             var junctionPosition = junction!.position;
             var approach = ApproachAtJunction(from);
@@ -392,9 +384,7 @@ namespace DvMod.RemoteDispatch
             // the left-hand road. Testing offset > 0 made those junctions appear
             // to have no left option and allowed the rightmost road to win.
             var leftmostOffset = LeftmostOffset(junction, junctionPosition, approach);
-            return chosenOffset < leftmostOffset - BranchSideToleranceMeters
-                ? RightHandCost
-                : 0f;
+            return chosenOffset < leftmostOffset - BranchSideToleranceMeters;
         }
 
         private const float BranchSideToleranceMeters = 0.25f;
@@ -410,17 +400,6 @@ namespace DvMod.RemoteDispatch
                     LateralOffset(junctionPosition, approach, branch.track, branch.first));
             }
             return leftmost;
-        }
-
-        private static int CountRightHandChoices(List<TrackGraph.Step> path)
-        {
-            var count = 0;
-            for (var i = 0; i + 1 < path.Count; i++)
-            {
-                if (RightHandPenalty(path[i], path[i + 1]) > 0f)
-                    count++;
-            }
-            return count;
         }
 
         /// True when the route arrives on the stem here and the switch actually
@@ -451,7 +430,7 @@ namespace DvMod.RemoteDispatch
                 var junctionPosition = junction!.position;
                 var approach = ApproachAtJunction(from);
                 var leftmostOffset = LeftmostOffset(junction, junctionPosition, approach);
-                var tookLeft = RightHandPenalty(from, to) == 0f;
+                var tookLeft = !IsRightHandChoice(from, to);
                 if (tookLeft)
                     route.leftDivergences++;
                 else
@@ -968,6 +947,7 @@ namespace DvMod.RemoteDispatch
             new JProperty("requiresReverse", route.requiresReverse),
             new JProperty("leftDivergences", route.leftDivergences),
             new JProperty("rightDivergences", route.rightDivergences),
+            new JProperty("distanceMeters", System.Math.Round(route.distanceMeters, 1)),
             new JProperty("divergenceDetail", route.divergenceDetail),
             new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
             new JProperty("passedTracks", route.progressIndex));
