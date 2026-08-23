@@ -27,7 +27,7 @@ namespace DvMod.RemoteDispatch
             }
 
             public Junction? ExitJunction => enteredViaIn ? track.outJunction : track.inJunction;
-            public Junction.Branch? ExitBranch => enteredViaIn ? track.outBranch : track.inBranch;
+
 
             public bool Equals(Step other) => track == other.track && enteredViaIn == other.enteredViaIn;
             public override bool Equals(object obj) => obj is Step step && Equals(step);
@@ -52,40 +52,41 @@ namespace DvMod.RemoteDispatch
             return step.enteredViaIn ? curve.Last().position : curve[0].position;
         }
 
-        /// Successors of a step: the branches reachable through the junction at
-        /// its exit end. Returns nothing at a dead end (no junction).
+        /// Successors of a step: what can be reached off the far end of this
+        /// track.
+        ///
+        /// Delegates to the game's own GetAllOutBranches/GetAllInBranches, which
+        /// resolve a junction fan when there is a junction and fall back to the
+        /// directly connected neighbour when there is not. Doing this by hand
+        /// means restating the convention that a track presents itself as
+        /// first:true at its in end and first:false at its out end, and getting
+        /// that backwards silently yields no successors at all.
         public static IEnumerable<Step> Successors(Step step)
         {
-            var junction = step.ExitJunction;
-            var branch = step.ExitBranch;
-            if (junction == null || branch == null)
+            if (step.track == null)
                 yield break;
 
-            var next = junction.GetAllNextPotentialBranches(step.track, branch.first);
-            if (next == null)
+            // Entering via the in end means leaving by the out end.
+            var connected = step.enteredViaIn ? step.track.outIsConnected : step.track.inIsConnected;
+            if (!connected)
                 yield break;
 
-            foreach (var candidate in next)
+            var branches = step.enteredViaIn
+                ? step.track.GetAllOutBranches()
+                : step.track.GetAllInBranches();
+            if (branches == null)
+                yield break;
+
+            foreach (var candidate in branches)
             {
                 if (candidate == null || candidate.track == null || candidate.track == step.track)
                     continue;
-                // Which end of the next track meets this junction decides the
-                // direction we travel along it. Junction identity is the reliable
-                // test; the branch's `first` flag describes the bezier endpoint,
-                // not which of the track's two junctions we came through.
-                bool enteredViaIn;
-                if (candidate.track.inJunction == junction)
-                    enteredViaIn = true;
-                else if (candidate.track.outJunction == junction)
-                    enteredViaIn = false;
-                else
-                    continue;
-                yield return new Step(candidate.track, enteredViaIn);
+                // A branch's `first` says which end of that track meets this
+                // point, which is the end we enter it by.
+                yield return new Step(candidate.track, candidate.first);
             }
         }
 
-        /// Find a path of tracks from `start` to any track in `goals`.
-        /// Returns null when no route exists.
         /// `extraCost` adds a penalty to a transition, used to express left-hand
         /// running. It is a cost rather than a hard rule, so an equal-length left
         /// road always wins while a much shorter right-hand route stays reachable.
