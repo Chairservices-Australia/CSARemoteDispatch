@@ -25,6 +25,7 @@ const zoomHome = new L.Control.ZoomHome({
 }).addTo(map);
 
 let markerToFollow;
+let followMode = null;   // 'player' | 'train' | null
 map.addEventListener('mousedown', stopFollowing);
 map.on('drag', () => {
     map.fitBounds(map.getBounds());
@@ -40,6 +41,8 @@ function setMarkerToFollow(marker) {
 
 function stopFollowing() {
   markerToFollow = undefined;
+  followMode = null;
+  updateFollowButtons();
 }
 
 function zoomToAllPlayers() {
@@ -54,16 +57,104 @@ map.addEventListener('zoomhome', () => {
 });
 
 /////////////////////
+// follow controls
+
+// Following used to require clicking the marker itself, which is fiddly on a
+// moving train and easy to lose. These give it a fixed target you can hit.
+
+function updateFollowButtons() {
+  for (const button of document.querySelectorAll('.followControlButton'))
+    button.classList.toggle('active', followMode === button.dataset.followMode);
+}
+
+function followPlayer() {
+  // Follow the only player in single player; otherwise the first reported.
+  const marker = playerMarkers.values().next().value;
+  if (!marker) {
+    followMode = null;
+    updateFollowButtons();
+    return;
+  }
+  markerToFollow = marker;
+  followMode = 'player';
+  map.panTo(marker.getBounds().getCenter());
+  updateFollowButtons();
+}
+
+// Follow whichever train is selected in the routing tab, so the dispatcher can
+// watch the consist it is routing without hunting for it on the map.
+function followSelectedTrain() {
+  const trainsetId = Number(routeTrainSelect.value);
+  if (Number.isNaN(trainsetId)) {
+    followMode = null;
+    updateFollowButtons();
+    return;
+  }
+  let target = null;
+  for (const [carId, carData] of allCarData) {
+    if (carData.trainsetId !== trainsetId)
+      continue;
+    target = carId;
+    if (carId.startsWith('L-'))
+      break;
+  }
+  const marker = target && carMarkers.get(target);
+  if (!marker) {
+    followMode = null;
+    updateFollowButtons();
+    return;
+  }
+  markerToFollow = marker;
+  followMode = 'train';
+  map.panTo(marker.getBounds().getCenter());
+  updateFollowButtons();
+}
+
+const FollowControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd: function () {
+    const container = L.DomUtil.create('div', 'leaflet-bar followControl');
+    const buttons = [
+      { mode: 'player', icon: 'fa-street-view', title: 'Follow me', handler: followPlayer },
+      { mode: 'train', icon: 'fa-train', title: 'Follow selected train', handler: followSelectedTrain },
+    ];
+    for (const spec of buttons) {
+      const link = L.DomUtil.create('a', 'followControlButton', container);
+      link.href = '#';
+      link.title = spec.title;
+      link.dataset.followMode = spec.mode;
+      link.innerHTML = `<i class="fas ${spec.icon}"></i>`;
+      L.DomEvent.on(link, 'click', L.DomEvent.stop);
+      L.DomEvent.on(link, 'click', () => {
+        if (followMode === spec.mode)
+          stopFollowing();
+        else
+          spec.handler();
+      });
+    }
+    L.DomEvent.disableClickPropagation(container);
+    return container;
+  },
+});
+
+map.addControl(new FollowControl());
+
+/////////////////////
 // settings
 
+// The theme class goes on <body> as well as the map, so the sidebar, tables and
+// controls can be themed rather than only the map backdrop.
+function applyTheme(theme) {
+  const dark = theme === 'dark';
+  document.body.classList.toggle('theme-dark', dark);
+  document.body.classList.toggle('theme-light', !dark);
+  document.getElementById('map').classList.toggle('dark', dark);
+}
+
 document.getElementById('themeDropdown')
-  .addEventListener('input', e => {
-    if (e.target.value === 'dark') {
-      document.getElementById('map').classList.add('dark');
-    } else {
-      document.getElementById('map').classList.remove('dark');
-    }
-  });
+  .addEventListener('input', e => applyTheme(e.target.value));
+
+applyTheme(document.getElementById('themeDropdown').value);
 
 function getCarColorMode() {
   return document.getElementById('carColorDropdown').value;
@@ -537,21 +628,34 @@ function fillSelect(select, entries, keepValue) {
     select.value = previous;
 }
 
-// Trains are listed by their locomotive where they have one, since that is how
-// a dispatcher identifies a consist on the map.
+// Every locomotive is listed, not just remotely controllable ones: a dispatcher
+// sets roads for any train. Routing acts on the whole consist the loco is part
+// of, so unpowered consists are listed too, labelled by a car in them.
 function updateRouteTrainList() {
-  const trainsets = new Map();
+  const entries = [];
+  const seenTrainsets = new Set();
+
+  const locos = Array.from(allCarData.entries())
+    .filter(([carId, carData]) => carId.startsWith('L-') && carData.trainsetId >= 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  for (const [carId, carData] of locos) {
+    entries.push([String(carData.trainsetId), carId]);
+    seenTrainsets.add(carData.trainsetId);
+  }
+
+  // Consists with no locomotive, so shunted cuts can still be given a road.
+  const looseCars = new Map();
   for (const [carId, carData] of allCarData) {
     const id = carData.trainsetId;
-    if (id === undefined)
+    if (id === undefined || id < 0 || seenTrainsets.has(id))
       continue;
-    if (!trainsets.has(id) || carId.startsWith('L-'))
-      trainsets.set(id, carId);
+    if (!looseCars.has(id))
+      looseCars.set(id, carId);
   }
-  fillSelect(
-    routeTrainSelect,
-    [...trainsets.entries()].map(([id, carId]) => [String(id), carId]),
-    true);
+  for (const [id, carId] of [...looseCars.entries()].sort((a, b) => a[1].localeCompare(b[1])))
+    entries.push([String(id), carId + ' (no loco)']);
+
+  fillSelect(routeTrainSelect, entries, true);
 }
 
 function updateRouteTrackList() {
@@ -587,7 +691,7 @@ function refreshRoutes() {
 }
 
 function clearRoute(routeId) {
-  fetch(new URL(`/route/${routeId}/clear`, location), { method: 'POST' })
+  fetch(new URL(`/route/${routeId}/clear`, location), { method: 'POST', body: '' })
     .then(response => response.json())
     .then(renderRoutes)
     .catch(() => {});
@@ -602,9 +706,9 @@ document.getElementById('routeSetButton')
       return;
     }
     routeMessage.textContent = 'Planning...';
-    fetch(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST' })
+    fetch(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST', body: '' })
       .then(response => response.status === 403
-        ? Promise.reject(new Error('No junction permission for this user.'))
+        ? Promise.reject(new Error('No junction permission. Enable it for your user in the CSA Remote Dispatch settings in Unity Mod Manager.'))
         : response.json())
       .then(route => {
         routeMessage.textContent = route.message || route.status;
@@ -1092,6 +1196,7 @@ function updateAllCars(updateCarData) {
     if (!updateCarData[carId])
       removeCar(carId);
   updateLocoList();
+  updateRouteTrainList();
 }
 
 function updateCars(cars) {

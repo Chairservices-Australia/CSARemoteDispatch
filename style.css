@@ -247,3 +247,225 @@ body {
 .routeStatus-Active { color: #2e7d32; font-weight: bold; }
 .routeStatus-Pending { color: #b8860b; font-weight: bold; }
 .routeStatus-Conflict, .routeStatus-Failed { color: #c62828; font-weight: bold; }
+
+/* ------------------------------------------------------------------ *
+ * Theme
+ *
+ * Tokens are defined for light, then overridden for dark, so every rule
+ * below is written once against the variables.
+ * ------------------------------------------------------------------ */
+:root,
+body.theme-light {
+  --rd-bg: #f7f7f8;
+  --rd-panel: #ffffff;
+  --rd-panel-alt: #f0f1f3;
+  --rd-text: #1c1e21;
+  --rd-text-muted: #5c6370;
+  --rd-border: #d2d5da;
+  --rd-accent: #2f6fb5;
+  --rd-accent-text: #ffffff;
+  --rd-hover: #e8eaed;
+  --rd-shadow: rgba(0, 0, 0, 0.18);
+}
+
+body.theme-dark {
+  --rd-bg: #1b1d21;
+  --rd-panel: #24272c;
+  --rd-panel-alt: #2b2f35;
+  --rd-text: #e6e8eb;
+  --rd-text-muted: #9aa1ab;
+  --rd-border: #3a3f47;
+  --rd-accent: #4f8fd6;
+  --rd-accent-text: #10131a;
+  --rd-hover: #333840;
+  --rd-shadow: rgba(0, 0, 0, 0.55);
+}
+
+body {
+  background: var(--rd-bg);
+  color: var(--rd-text);
+}
+
+/* Panels ----------------------------------------------------------- */
+.leaflet-sidebar {
+  color: var(--rd-text);
+}
+.leaflet-sidebar-content,
+.leaflet-sidebar-tabs,
+.leaflet-sidebar-tabs > ul {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+}
+.leaflet-sidebar-tabs a {
+  color: var(--rd-text-muted);
+}
+.leaflet-sidebar-tabs a:hover {
+  background: var(--rd-hover);
+  color: var(--rd-text);
+}
+.leaflet-sidebar-tabs li.active a,
+.leaflet-sidebar-tabs a.active {
+  background: var(--rd-accent);
+  color: var(--rd-accent-text);
+}
+.leaflet-sidebar-pane {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+}
+
+/* Tables ----------------------------------------------------------- */
+table {
+  color: var(--rd-text);
+}
+table th {
+  color: var(--rd-text-muted);
+  border-bottom: 1px solid var(--rd-border);
+}
+table td {
+  border-color: var(--rd-border);
+}
+tbody tr:nth-child(even) {
+  background: var(--rd-panel-alt);
+}
+tbody tr:hover {
+  background: var(--rd-hover);
+}
+tbody.following,
+td.following {
+  background: var(--rd-accent) !important;
+  color: var(--rd-accent-text) !important;
+}
+
+/* Controls --------------------------------------------------------- */
+button,
+select,
+input[type="text"],
+input[type="number"] {
+  font: inherit;
+  color: var(--rd-text);
+  background: var(--rd-panel-alt);
+  border: 1px solid var(--rd-border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  outline: none;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+select {
+  /* Native dropdown lists follow the control colours only when the option
+     elements are painted too. */
+  max-width: 100%;
+}
+option {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+}
+button {
+  cursor: pointer;
+  font-weight: 600;
+}
+button:hover,
+select:hover,
+input[type="text"]:hover {
+  background: var(--rd-hover);
+  border-color: var(--rd-accent);
+}
+button:active {
+  transform: translateY(1px);
+}
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  border-color: var(--rd-accent);
+  box-shadow: 0 0 0 2px var(--rd-accent);
+}
+input[type="checkbox"] {
+  accent-color: var(--rd-accent);
+  width: 15px;
+  height: 15px;
+  vertical-align: middle;
+}
+input[type="range"] {
+  accent-color: var(--rd-accent);
+}
+
+/* The primary action in the routing pane. */
+#routeSetButton {
+  background: var(--rd-accent);
+  color: var(--rd-accent-text);
+  border-color: var(--rd-accent);
+  width: 100%;
+  padding: 6px 10px;
+}
+#routeSetButton:hover {
+  filter: brightness(1.1);
+}
+#routeListBody button {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* Loco control buttons -------------------------------------------- */
+.locoControlButton {
+  border-radius: 4px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+}
+.locoControlButton:hover {
+  background: var(--rd-hover);
+  border-color: var(--rd-border);
+}
+
+/* Leaflet chrome and pop-outs -------------------------------------- */
+.leaflet-bar a,
+.leaflet-control-zoom a,
+.gin-control-zoom a {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+  border-bottom-color: var(--rd-border);
+}
+.leaflet-bar a:hover,
+.leaflet-control-zoom a:hover,
+.gin-control-zoom a:hover {
+  background: var(--rd-hover);
+  color: var(--rd-text);
+}
+.leaflet-bar {
+  border-radius: 4px;
+  box-shadow: 0 1px 5px var(--rd-shadow);
+}
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+  box-shadow: 0 2px 8px var(--rd-shadow);
+}
+.leaflet-popup-content-wrapper {
+  border-radius: 6px;
+  border: 1px solid var(--rd-border);
+}
+.leaflet-popup-close-button {
+  color: var(--rd-text-muted) !important;
+}
+.leaflet-popup-close-button:hover {
+  color: var(--rd-text) !important;
+}
+.leaflet-tooltip {
+  background: var(--rd-panel);
+  color: var(--rd-text);
+  border: 1px solid var(--rd-border);
+  box-shadow: 0 1px 4px var(--rd-shadow);
+}
+
+/* Follow controls -------------------------------------------------- */
+.followControl a.followControlButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+}
+.followControl a.followControlButton.active {
+  background: var(--rd-accent);
+  color: var(--rd-accent-text);
+}
