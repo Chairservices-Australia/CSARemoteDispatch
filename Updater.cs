@@ -10,10 +10,12 @@ namespace DvMod.RemoteDispatch
     public class Updater : MonoBehaviour
     {
         private static int mainThreadId;
+        private static Updater? instance;
 
         public void Start()
         {
             mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            instance = this;
             StartCoroutine(CheckPlayerTransformCoro());
             StartCoroutine(CheckTrainsetsCoro());
             StartCoroutine(DeferredEventsCoro());
@@ -35,11 +37,24 @@ namespace DvMod.RemoteDispatch
 
         public static void Destroy()
         {
+            instance = null;
             if (rootObject != null)
             {
                 GameObject.Destroy(rootObject);
                 rootObject = null;
             }
+        }
+
+        /// Run work that has to happen on the game thread but is too big for one
+        /// frame, letting it yield between slices. Must be called from the game
+        /// thread. Returns false when the mod is shutting down and there is
+        /// nothing left to run it on.
+        public static bool RunSliced(IEnumerator routine)
+        {
+            if (instance == null)
+                return false;
+            instance.StartCoroutine(routine);
+            return true;
         }
 
         private IEnumerator CheckPlayerTransformCoro()

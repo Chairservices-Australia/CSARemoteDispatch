@@ -151,9 +151,15 @@ namespace DvMod.RemoteDispatch
                     Stations.GetStationJSON).ConfigureAwait(false));
                 break;
             case "track":
-                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(() =>
-                    RailTracks.GetTrackPointJSON().GetAwaiter().GetResult()).ConfigureAwait(false));
+            {
+                // Started on the game thread, awaited on this one: the geometry
+                // is built across frames, so blocking the game thread until it
+                // finished would deadlock as well as freeze.
+                var geometry = await Updater.RunOnMainThread(
+                    RailTracks.GetTrackPointJSON).ConfigureAwait(false);
+                Render200(context, ContentTypes.Json, await geometry.ConfigureAwait(false));
                 break;
+            }
             case "trainset":
                 HandleTrainsetRequest(context);
                 break;
@@ -229,7 +235,9 @@ namespace DvMod.RemoteDispatch
         }
 
         /// GET  /route                       list active routes
-        /// POST /route/{trainsetId-or-carGuid}/{trackId} plan and set a route
+        /// POST /route/{trainsetId-or-carGuid}/{stops} plan and set a route,
+        ///      where {stops} is one destination or several separated by "|".
+        ///      A destination is a track ID or a junction ("J-482").
         /// POST /route/{routeId}/clear        release a route and its junctions
         private static async Task HandleRouteRequest(HttpListenerContext context)
         {
@@ -282,13 +290,22 @@ namespace DvMod.RemoteDispatch
                         failure = "The selected train is no longer available.";
                         return null;
                     }
-                    var destination = FindRailTrackById(second);
-                    if (destination == null)
+                    // One segment carries the whole itinerary, bar-separated,
+                    // so a road calling at several places needs no second shape
+                    // of request. Each stop is a track ID or a junction.
+                    var stops = RouteDestination.SplitStops(second);
+                    if (stops.Count == 0)
                     {
-                        failure = "No track called \"" + second + "\".";
+                        failure = "No destination was given.";
                         return null;
                     }
-                    var route = Routing.SetRoute(trainset, destination, second);
+                    var missing = RouteDestination.FirstMissing(stops);
+                    if (missing != null)
+                    {
+                        failure = "No track or junction called \"" + missing + "\".";
+                        return null;
+                    }
+                    var route = Routing.SetRoute(trainset, stops);
                     route.requestedBy = context.User.Identity.Name ?? "";
                     return Routing.ToJson(route);
                 }).ConfigureAwait(false);
@@ -303,21 +320,6 @@ namespace DvMod.RemoteDispatch
             }
 
             RenderError(context, 404, "Unknown route request.");
-        }
-
-        /// Accepts either form of track ID: the canonical "GF-D-05-I" or the
-        /// shorter "GF-D5I" the game prints on jobs and signage.
-        private static RailTrack? FindRailTrackById(string trackId)
-        {
-            foreach (var track in Component.FindObjectsOfType<RailTrack>())
-            {
-                var logicTrack = track == null ? null : track.LogicTrack();
-                if (logicTrack == null)
-                    continue;
-                if (logicTrack.ID.FullID == trackId || logicTrack.ID.FullDisplayID == trackId)
-                    return track;
-            }
-            return null;
         }
 
         private static async Task HandleJunctionRequest(HttpListenerContext context)

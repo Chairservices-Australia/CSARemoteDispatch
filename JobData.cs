@@ -8,6 +8,7 @@ using Newtonsoft.Json;
 using System.Collections.Generic;
 using System.Linq;
 using System;
+using UnityEngine;
 
 namespace DvMod.RemoteDispatch
 {
@@ -35,6 +36,87 @@ namespace DvMod.RemoteDispatch
             return JobForId(jobId);
         }
 
+        /// Every job with at least one of its cars in this consist, most
+        /// relevant first.
+        ///
+        /// "What is this train working" is not the same question as "what job is
+        /// the driver's car on". A locomotive is never one of a job's cars, so
+        /// asking about the car the driver sits in reports no job at all the
+        /// moment the train is coupled up and ready to leave - which is exactly
+        /// when the answer is wanted.
+        ///
+        /// Read from the live job registry rather than the per-car index, which
+        /// is filled by a patch on the game's own plate update and can therefore
+        /// be missing a job that was set up before this mod loaded.
+        public static List<Job> JobsForTrainset(Trainset? trainset)
+        {
+            var result = new List<Job>();
+            var cars = trainset?.cars;
+            if (cars == null || cars.Count == 0)
+                return result;
+            var manager = SingletonBehaviour<JobsManager>.Instance;
+            if (manager == null || manager.jobToJobCars == null)
+                return result;
+
+            var inConsist = new HashSet<TrainCar>();
+            foreach (var car in cars)
+            {
+                if (car != null)
+                    inConsist.Add(car);
+            }
+
+            var carsHere = new Dictionary<Job, int>();
+            foreach (var pair in manager.jobToJobCars)
+            {
+                var job = pair.Key;
+                if (job == null || pair.Value == null)
+                    continue;
+                var matched = 0;
+                foreach (var car in pair.Value)
+                {
+                    var trainCar = car?.TrainCar();
+                    if (trainCar != null && inConsist.Contains(trainCar))
+                        matched++;
+                }
+                if (matched > 0)
+                    carsHere[job] = matched;
+            }
+
+            result.AddRange(carsHere.Keys);
+            // Taken jobs first, then whichever has most of its cars on the
+            // drawbar, then by ID - so the order is the same from one poll to
+            // the next rather than however the registry happened to enumerate.
+            result.Sort((a, b) =>
+            {
+                var takenA = a.State == JobState.InProgress ? 0 : 1;
+                var takenB = b.State == JobState.InProgress ? 0 : 1;
+                if (takenA != takenB)
+                    return takenA - takenB;
+                if (carsHere[a] != carsHere[b])
+                    return carsHere[b] - carsHere[a];
+                return string.CompareOrdinal(a.ID, b.ID);
+            });
+            return result;
+        }
+
+        /// How many of a job's cars are in this consist.
+        public static int CarsOfJobIn(Job job, Trainset? trainset)
+        {
+            var cars = trainset?.cars;
+            var manager = SingletonBehaviour<JobsManager>.Instance;
+            if (cars == null || job == null || manager?.jobToJobCars == null
+                || !manager.jobToJobCars.TryGetValue(job, out var jobCars) || jobCars == null)
+                return 0;
+            var matched = 0;
+            foreach (var car in jobCars)
+            {
+                var trainCar = car?.TrainCar();
+                if (trainCar != null && cars.Contains(trainCar))
+                    matched++;
+            }
+            return matched;
+        }
+
         private static Dictionary<TrainCar, string> InitializeJobIdForCar()
         {
             return SingletonBehaviour<JobsManager>.Instance.jobToJobCars
@@ -42,13 +124,40 @@ namespace DvMod.RemoteDispatch
                 .ToDictionary(p => p.trainCar, p => p.job.ID);
         }
 
+        /// The least time between index rebuilds forced by a lookup that found
+        /// nothing.
+        private const float JobIndexRebuildSeconds = 5f;
+        private static float lastJobIndexBuild = float.NegativeInfinity;
+
         public static Job? JobForId(string jobId)
         {
             if (jobForId.TryGetValue(jobId, out var job))
                 return job;
-            jobForId = SingletonBehaviour<JobsManager>.Instance.jobToJobCars.Keys.ToDictionary(job => job.ID);
+
+            // A miss used to rebuild the whole index from JobsManager. That is
+            // right when a job has just been created, and ruinous when a car
+            // still carries the ID of a job that has finished: every car update
+            // rebuilt it again, several times a second, and never found
+            // anything. One rebuild per interval covers the first case without
+            // paying for the second.
+            if (Time.time - lastJobIndexBuild < JobIndexRebuildSeconds)
+                return null;
+            RebuildJobIndex();
             jobForId.TryGetValue(jobId, out job);
             return job;
+        }
+
+        private static void RebuildJobIndex()
+        {
+            lastJobIndexBuild = Time.time;
+            var rebuilt = new Dictionary<string, Job>();
+            foreach (var job in SingletonBehaviour<JobsManager>.Instance.jobToJobCars.Keys)
+            {
+                if (job != null && job.ID != null)
+                    rebuilt[job.ID] = job;   // indexer, not ToDictionary: a
+                                             // duplicate ID must not throw here
+            }
+            jobForId = rebuilt;
         }
 
         public static Dictionary<string, JObject> GetAllJobData()
@@ -157,8 +266,10 @@ namespace DvMod.RemoteDispatch
                     new JProperty("isActive", job.State == JobState.InProgress));
             }
 
-            // ensure cache is updated
-            JobForId("");
+            // The whole job list is being written, so this one is worth an
+            // unconditional rebuild rather than the rate-limited one a lookup
+            // gets.
+            RebuildJobIndex();
             return jobForId.ToDictionary(
                 kvp => kvp.Key,
                 kvp => JobToJson(kvp.Value));

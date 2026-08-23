@@ -159,8 +159,11 @@ namespace DvMod.RemoteDispatch
         /// How many distinct track/direction states are reachable from a step.
         /// A tiny number means graph traversal is broken rather than the
         /// destination being genuinely unreachable, which is the useful thing to
-        /// know when a route fails.
-        public static int CountReachable(Step start, int limit = 20000)
+        /// know when a route fails. The limit is low deliberately: this runs on
+        /// the failure path, where a full sweep of the network would make a
+        /// route that cannot be found cost more than one that can, and telling
+        /// "broken" from "unreachable" needs no more than this.
+        public static int CountReachable(Step start, int limit = 2000)
         {
             var seen = new HashSet<Step> { start };
             var queue = new Queue<Step>();

@@ -24,6 +24,14 @@ namespace DvMod.RemoteDispatch
         public string id = "";
         public int trainsetId;
         public string destinationTrackId = "";
+
+        /// Every place this road calls at, in order, and which of them it is
+        /// running to now. A road with one destination is a one-stop list, so
+        /// the same machinery carries both; destinationTrackId is always the
+        /// stop in hand, which is what the rest of the class plans towards.
+        public List<string> stops = new List<string>();
+        public int stopIndex;
+
         public int priority;                       // tie-breaker for equally close approaches
         public RouteStatus status = RouteStatus.Active;
         public string message = "";
@@ -71,6 +79,74 @@ namespace DvMod.RemoteDispatch
         public int allocatedUpTo = int.MaxValue;
         public string heldShortOf = "";
 
+        /// True while the road stops short of a crossing that is being kept
+        /// neutral rather than one another road holds, so the two can be told
+        /// apart in what the train is shown.
+        public bool heldForApproach;
+
+        /// Crossings this road has come close enough to claim outright.
+        ///
+        /// A locked junction is not taken by a nearer train: once a train is
+        /// committed to a crossing the road in front of it does not change
+        /// under it, and two trains cannot trade the crossing back and forth as
+        /// their distances cross. The lock is given back as the train passes.
+        public readonly HashSet<Junction> approachLocked = new HashSet<Junction>();
+
+        /// The contested crossing this road is waiting to approach, if any, with
+        /// the distance and the time it began waiting. Only ever one, because
+        /// the allocation stops at the first crossing that is held.
+        public Junction? approachHeld;
+        public float approachHeldSince;
+        public float approachHeldDistance;
+
+        /// How near this road's train last stood to a crossing it has locked,
+        /// and when. A train that stops closing on one it has claimed gives it
+        /// back rather than holding it against everyone for ever.
+        public float lockedDistance = float.PositiveInfinity;
+        public float lockedSince;
+
+        /// Forget the leg just travelled, keeping the road's identity and the
+        /// stops it has yet to call at, so the next leg is planned into this
+        /// same entry instead of appearing as a new road on every page.
+        public void ResetLeg()
+        {
+            settings = new List<JunctionSetting>();
+            trackIds = new List<string>();
+            pathTracks = new List<RailTrack>();
+            pathSteps = new List<TrackGraph.Step>();
+            divergenceDetail = new JArray();
+            pending.Clear();
+            approachLocked.Clear();
+            approachHeld = null;
+            requiresReverse = false;
+            leftDivergences = 0;
+            rightDivergences = 0;
+            distanceMeters = 0f;
+            allocationApplied = false;
+            waitingForSignal = false;
+            progressIndex = 0;
+            releasedUpTo = 0;
+            rerouteCount = 0;
+            offRouteSince = 0f;
+            wrongWaySince = 0f;
+            notice = "";
+            nextObstructionRerouteTime = 0f;
+            obstructedTrackId = "";
+            hasReverseLeg = false;
+            onReverseLeg = false;
+            reverseSteps = new List<TrackGraph.Step>();
+            reverseTracks = new List<RailTrack>();
+            reverseTrackIds = new List<string>();
+            reversalJunction = null;
+            reversalTrackId = "";
+            reversalSignalName = "";
+            runOutMeters = 0f;
+            allocatedUpTo = int.MaxValue;
+            heldShortOf = "";
+            heldForApproach = false;
+            lockedDistance = float.PositiveInfinity;
+        }
+
         /// The player whose request laid this road, in a session. Empty in
         /// single player, where there is only one.
         public string requestedBy = "";
@@ -89,17 +165,51 @@ namespace DvMod.RemoteDispatch
     ///
     /// Junctions are never thrown under a car: anything not clear is deferred and
     /// retried until it is. Each route reserves the junctions it needs, so two
-    /// routes cannot fight over the same switch. Contested junctions go to the
-    /// train with the shortest remaining approach; route priority only breaks a
-    /// near tie.
+    /// routes cannot fight over the same switch. A crossing both want set the
+    /// other way is left as it lies until one of their trains is on approach;
+    /// that train then locks it and keeps it until it has passed. Which train
+    /// that is comes from the shortest remaining approach, with route priority
+    /// only breaking a near tie.
+    ///
+    /// A road may call at several places in turn. Only the leg in hand is ever
+    /// planned: the next is laid from wherever the train actually stands when it
+    /// arrives, which is also the only position the one after it can be planned
+    /// from.
     public static class Routing
     {
         private static readonly Dictionary<string, TrainRoute> routes = new Dictionary<string, TrainRoute>();
         private static readonly Dictionary<Junction, string> reservations = new Dictionary<Junction, string>();
         private static int nextRouteId = 1;
 
+        /// Reused by DistanceToJunction, which is asked several times a tick
+        /// and filled the same way every time. Safe to share: nothing it calls
+        /// re-enters it, and the contents do not outlive the call.
+        private static readonly HashSet<RailTrack> distanceScratch = new HashSet<RailTrack>();
+
         public const float RetryIntervalSeconds = 1f;
         public const float JunctionPriorityHysteresisMeters = 25f;
+
+        /// How close a train must come before a contested crossing is set and
+        /// locked to it. Beyond this the crossing is left as it lies, so a
+        /// switch is never thrown for a train that is still kilometres off and
+        /// two roads do not trade one while both are a long way away.
+        public const float ApproachLockMeters = 400f;
+
+        /// How long a road may sit at a crossing it is first in line for, no
+        /// closer than when it arrived, before the crossing is given to it
+        /// anyway.
+        ///
+        /// A train held short of a crossing may already be as close as its road
+        /// lets it get - stopped at the signal protecting it, which can stand
+        /// further out than the approach distance. Waiting for an approach that
+        /// can never happen would hold both roads for ever.
+        public const float ApproachHoldTimeoutSeconds = 20f;
+
+        /// How long a train that has claimed a crossing may go without getting
+        /// any nearer to it before another train may have it. A road in front of
+        /// a moving train is never altered; one in front of a train that has
+        /// stopped and stayed stopped is not held against the whole railway.
+        public const float ApproachLockStaleSeconds = 60f;
 
         /// Direction of a track at one of its ends, taken from the segment
         /// nearest that end.
@@ -309,6 +419,25 @@ namespace DvMod.RemoteDispatch
             return 0;
         }
 
+        /// The consist a route belongs to.
+        ///
+        /// A plain loop rather than List.Find: the predicate closes over the ID,
+        /// so every call allocated a delegate, and the route machinery asks this
+        /// several times a second for every road it is holding.
+        public static Trainset? FindTrainset(int trainsetId)
+        {
+            var sets = Trainset.allSets;
+            if (sets == null)
+                return null;
+            for (var i = 0; i < sets.Count; i++)
+            {
+                var set = sets[i];
+                if (set != null && set.id == trainsetId)
+                    return set;
+            }
+            return null;
+        }
+
         public static TrainRoute? GetRoute(string id) =>
             routes.TryGetValue(id, out var route) ? route : null;
 
@@ -349,50 +478,82 @@ namespace DvMod.RemoteDispatch
             var car = string.IsNullOrEmpty(trainCarGuid)
                 ? null : TrainCarRegistry.Instance.GetTrainCarByCarGuid(trainCarGuid);
             var trainset = car?.trainset
-                ?? Trainset.allSets?.Find(set => set.id == trainsetId);
-            var destination = FindTrack(destinationTrackId);
-            if (trainset == null || destination == null)
+                ?? FindTrainset(trainsetId);
+            // One field carries the whole itinerary, so a client's multi-stop
+            // request survives the trip to the host unchanged.
+            var stops = RouteDestination.SplitStops(destinationTrackId);
+            if (trainset == null || stops.Count == 0)
             {
                 Main.DebugLog(() => $"Route request from {requestedBy} for train {trainsetId} "
                     + $"to {destinationTrackId} could not be resolved.");
                 return;
             }
-            var route = SetRoute(trainset, destination, destinationTrackId);
+            var route = SetRoute(trainset, stops);
             route.requestedBy = requestedBy;
         }
 
-        /// Plan and apply a route for a trainset to a destination track.
+        /// Plan and apply a road that calls at each of these places in turn.
+        ///
+        /// Only the leg in hand is laid now. The stops after it are held until
+        /// the train arrives, because a leg can only be planned from where the
+        /// train will actually stand when it starts, and that is not known until
+        /// the leg before it has been run.
         public static TrainRoute SetRoute(
-            Trainset trainset, RailTrack destination, string destinationTrackId,
-            bool allowReversal = true)
+            Trainset trainset, IList<string> stops, bool allowReversal = true, int startStop = 0)
         {
             var sequence = nextRouteId++;
             var route = new TrainRoute
             {
                 id = "r" + sequence,
                 trainsetId = trainset.id,
-                destinationTrackId = destinationTrackId,
                 sequence = sequence,
                 colorIndex = NextFreeColorIndex(),
+                stops = RouteDestination.SplitStops(RouteDestination.JoinStops(stops)),
             };
+            if (route.stops.Count == 0)
+            {
+                route.status = RouteStatus.Failed;
+                route.message = "No destination was given.";
+                routes[route.id] = route;
+                return route;
+            }
+            route.stopIndex = Mathf.Clamp(startStop, 0, route.stops.Count - 1);
+            route.destinationTrackId = route.stops[route.stopIndex];
 
             // Clients submit their own request, while the host performs the one
             // shared allocation so independently refreshing pages cannot fight
             // over a turnout. The host broadcasts the resulting route table.
-            if (RouteNetwork.RequestRoute(trainset, destinationTrackId))
+            if (RouteNetwork.RequestRoute(trainset,
+                RouteDestination.JoinStops(route.stops.Skip(route.stopIndex))))
             {
                 route.status = RouteStatus.Pending;
                 route.message = "Planning route...";
                 return route;
             }
 
+            PlanLeg(route, trainset, allowReversal);
+            routes[route.id] = route;
+            if (route.status != RouteStatus.Failed)
+            {
+                TryActivate(route);
+                Sessions.AddTag("routes");
+            }
+            return route;
+        }
+
+        /// Lay a road for the stop in hand into a route that already has its
+        /// identity and its list of stops. Returns false with the reason left on
+        /// the route when no road exists; whether the route is in the table is
+        /// the caller's business, since a replanned leg is already there.
+        private static bool PlanLeg(TrainRoute route, Trainset trainset, bool allowReversal)
+        {
+            var destinationTrackId = route.destinationTrackId;
             var candidates = StartCandidates(trainset).ToList();
             if (candidates.Count == 0)
             {
                 route.status = RouteStatus.Failed;
                 route.message = "Could not determine which track the train is on.";
-                routes[route.id] = route;
-                return route;
+                return false;
             }
 
             // The consist occupies several tracks; a road that immediately runs
@@ -400,14 +561,17 @@ namespace DvMod.RemoteDispatch
             var occupied = new HashSet<RailTrack>();
             Occupancy.TracksOccupiedBy(trainset, occupied);
 
-            // One logical destination can consist of multiple RailTrack objects
-            // (and modded layouts commonly duplicate an ID across their physical
-            // segments). Treat every matching component as a goal; selecting the
-            // first object alone can choose an isolated duplicate and report no
-            // route despite the platform being connected.
-            var goals = new HashSet<RailTrack>(FindTracks(destinationTrackId));
+            // A destination is a set of tracks, not one: a named platform can be
+            // several RailTrack objects sharing an ID, and a junction stop is
+            // every rail that meets it. See RouteDestination.
+            var goals = RouteDestination.Goals(destinationTrackId);
             if (goals.Count == 0)
-                goals.Add(destination);
+            {
+                route.status = RouteStatus.Failed;
+                route.message = "There is no "
+                    + RouteDestination.Describe(destinationTrackId) + " in the loaded world.";
+                return false;
+            }
             var occupiedByOthers = new HashSet<RailTrack>();
             var poweredByOthers = new HashSet<RailTrack>();
             Occupancy.OccupiedTracksByOthers(
@@ -424,8 +588,7 @@ namespace DvMod.RemoteDispatch
                 {
                     route.status = RouteStatus.Failed;
                     route.message = "Detached cars share the train's track. Set the reverser toward the clear end before routing.";
-                    routes[route.id] = route;
-                    return route;
+                    return false;
                 }
                 candidates = new List<TrackGraph.Step> { candidates[0] };
             }
@@ -468,8 +631,13 @@ namespace DvMod.RemoteDispatch
             // not positions along one track, so allowing the start state would
             // otherwise make cars behind the consist invisible to the reverse
             // leg and favour an impossible "shortest" route.
+            // Nothing a reversal can produce costs less than the penalty for
+            // changing ends, so a direct road already inside that is the answer
+            // and the search below - which is the most expensive thing this mod
+            // does - is not worth starting.
             var reversal = allowReversal && reversalStartClear
-                ? PlanReversal(candidates, goals, ConsistLength(trainset), IsBlocked)
+                    && bestRouteCost > ReversalPenaltyMeters
+                ? PlanReversal(candidates, goals, ConsistLength(trainset), IsBlocked, bestRouteCost)
                 : null;
             var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
 
@@ -477,11 +645,11 @@ namespace DvMod.RemoteDispatch
             {
                 var reach = candidates.Select(c => TrackGraph.CountReachable(c)).ToList();
                 route.status = RouteStatus.Failed;
-                route.message = "No route found to " + DescribeTrack(destination)
+                route.message = "No route found to "
+                    + RouteDestination.Describe(destinationTrackId)
                     + " from " + DescribeTrack(candidates[0].track)
                     + " (reachable states: " + string.Join(", ", reach) + ").";
-                routes[route.id] = route;
-                return route;
+                return false;
             }
 
             if (useReversal)
@@ -514,9 +682,9 @@ namespace DvMod.RemoteDispatch
                 // supplied one. Stated rather than asserted so a future change
                 // to the two branches above cannot fall through silently.
                 route.status = RouteStatus.Failed;
-                route.message = "Could not lay a road to " + DescribeTrack(destination) + ".";
-                routes[route.id] = route;
-                return route;
+                route.message = "Could not lay a road to "
+                    + RouteDestination.Describe(destinationTrackId) + ".";
+                return false;
             }
 
             route.priority = PriorityFor(chosen.track);
@@ -533,11 +701,8 @@ namespace DvMod.RemoteDispatch
             route.trackIds = TrackIdsOf(path);
             route.settings = SettingsForPath(path);
             CountDivergences(path, route);
-
-            routes[route.id] = route;
-            TryActivate(route);
-            Sessions.AddTag("routes");
-            return route;
+            route.status = RouteStatus.Active;
+            return true;
         }
 
         /// The longest run-out considered when looking for somewhere to change
@@ -571,9 +736,11 @@ namespace DvMod.RemoteDispatch
         /// leaving commits it to the far side of that turnout. What a driver
         /// does is pull out far enough to stand clear, then set back over it
         /// onto the other road, and that is what this looks for.
+        /// `ceiling` is what a plan has to beat to be worth having: the cost of
+        /// the direct road, or infinity when there is none.
         private static ReversalPlan? PlanReversal(
             List<TrackGraph.Step> candidates, HashSet<RailTrack> goals, float consistLength,
-            System.Func<TrackGraph.Step, bool> isBlocked)
+            System.Func<TrackGraph.Step, bool> isBlocked, float ceiling)
         {
             // One sweep out of the destination says which states can still reach
             // it, so the thousands of places a train might stand can be filtered
@@ -604,13 +771,27 @@ namespace DvMod.RemoteDispatch
 
                 foreach (var entry in viable)
                 {
+                    // The run out is already known, and the straight line from
+                    // where it ends to the destination cannot be longer than the
+                    // rails that cover it. That makes a floor on what this probe
+                    // could possibly cost, which is worth having because the
+                    // search that would confirm it is a road search across the
+                    // whole network. Most probes cannot beat the road already in
+                    // hand and are dropped here without one.
+                    var outbound = exploration.PathTo(entry.Key);
+                    if (outbound.Count == 0)
+                        continue;
+                    var outboundMeters = PathLength(outbound);
+                    var floor = outboundMeters
+                        + GoalDistance(TrackGraph.Flip(entry.Key), goals)
+                        + ReversalPenaltyMeters;
+                    if (floor >= Mathf.Min(ceiling, best == null ? float.PositiveInfinity : best.Cost))
+                        continue;
+
                     var inbound = TrackGraph.FindPath(
                         TrackGraph.Flip(entry.Key), goals,
                         extraCost: LeftHandRunningPenalty, isBlocked: isBlocked);
                     if (inbound == null || inbound.Count == 0)
-                        continue;
-                    var outbound = exploration.PathTo(entry.Key);
-                    if (outbound.Count == 0)
                         continue;
 
                     var plan = new ReversalPlan
@@ -618,7 +799,7 @@ namespace DvMod.RemoteDispatch
                         start = candidate,
                         outbound = outbound,
                         inbound = inbound,
-                        outboundMeters = PathLength(outbound),
+                        outboundMeters = outboundMeters,
                         inboundMeters = PathLength(inbound),
                         runOutMeters = entry.Value,
                     };
@@ -764,7 +945,7 @@ namespace DvMod.RemoteDispatch
         {
             if (!SignalManager.Running || route.pathSteps.Count == 0)
                 return true;
-            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var trainset = FindTrainset(route.trainsetId);
             var fallback = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(car => car != null);
             if (fallback == null)
                 return false;
@@ -994,38 +1175,189 @@ namespace DvMod.RemoteDispatch
         private static int ConflictLimit(TrainRoute route, out string heldBy)
         {
             heldBy = "";
-            foreach (var setting in PendingSettings(route).OrderBy(s => s.pathIndex))
+            route.heldForApproach = false;
+            // The whole road ahead, not merely as far as the allocation reaches.
+            // A route already held short of a crossing has that crossing outside
+            // its allocation, so looking only within it would find no conflict
+            // and hand the route the very junction it is waiting for.
+            foreach (var setting in FutureSettings(route).OrderBy(s => s.pathIndex))
             {
-                if (!reservations.TryGetValue(setting.junction, out var ownerId) || ownerId == route.id)
-                    continue;
-                var owner = GetRoute(ownerId);
-                if (owner == null)
-                    continue;
-                var ownerSetting = PendingSettings(owner)
-                    .FirstOrDefault(s => s.junction == setting.junction);
-                if (ownerSetting == null || ownerSetting.branch == setting.branch)
-                    continue;
-                var challengerDistance = DistanceToJunction(route, setting);
-                var ownerDistance = DistanceToJunction(owner, ownerSetting);
-                var challengerIsCloser = challengerDistance + JunctionPriorityHysteresisMeters
-                    < ownerDistance;
-                var approachesAreTied = Mathf.Abs(challengerDistance - ownerDistance)
-                    <= JunctionPriorityHysteresisMeters;
-                if (challengerIsCloser || (approachesAreTied && route.priority > owner.priority))
+                var contested = false;
+                if (reservations.TryGetValue(setting.junction, out var ownerId) && ownerId != route.id)
                 {
-                    // Release the holder's entire allocation so its signal and
-                    // junctions agree, then let it compete again as the live
-                    // approach distances change.
-                    ReleaseAllocation(owner);
-                    owner.waitingForSignal = true;
-                    owner.status = RouteStatus.Pending;
-                    owner.message = "Held for nearer train on " + route.id + ".";
-                    continue;
+                    var owner = GetRoute(ownerId);
+                    var ownerSetting = owner == null ? null : FutureSettings(owner)
+                        .FirstOrDefault(s => s.junction == setting.junction);
+                    if (owner != null && ownerSetting != null && ownerSetting.branch != setting.branch)
+                    {
+                        contested = true;
+                        if (!TryTakeJunction(route, setting, owner, ownerSetting))
+                        {
+                            heldBy = "route " + ownerId + " (train " + owner.trainsetId + ")";
+                            route.approachHeld = null;
+                            return setting.pathIndex;
+                        }
+                    }
                 }
-                heldBy = "route " + ownerId + " (train " + owner.trainsetId + ")";
-                return setting.pathIndex;
+
+                if (!contested)
+                    contested = OthersWant(route, setting);
+                if (contested && !ClaimApproach(route, setting))
+                {
+                    heldBy = "an interlocked crossing";
+                    route.heldForApproach = true;
+                    return setting.pathIndex;
+                }
             }
+            route.approachHeld = null;
             return int.MaxValue;
+        }
+
+        /// Whether this route may take a contested junction from the route
+        /// currently holding it.
+        ///
+        /// The nearer approach wins, by enough of a margin that a crossing does
+        /// not change hands over a few metres. A holder whose train is already
+        /// on approach keeps it whatever the distances say: a road in front of a
+        /// train committed to it is not altered.
+        private static bool TryTakeJunction(
+            TrainRoute route, JunctionSetting setting, TrainRoute owner, JunctionSetting ownerSetting)
+        {
+            if (owner.approachLocked.Contains(setting.junction)
+                && !LockHasGoneStale(owner, ownerSetting))
+                return false;
+
+            var challengerDistance = DistanceToJunction(route, setting);
+            var ownerDistance = DistanceToJunction(owner, ownerSetting);
+            var challengerIsCloser = challengerDistance + JunctionPriorityHysteresisMeters
+                < ownerDistance;
+            var approachesAreTied = Mathf.Abs(challengerDistance - ownerDistance)
+                <= JunctionPriorityHysteresisMeters;
+            if (!challengerIsCloser && !(approachesAreTied && route.priority > owner.priority))
+                return false;
+
+            // Release the holder's entire allocation so its signal and junctions
+            // agree, then let it compete again as the live approach distances
+            // change.
+            ReleaseAllocation(owner);
+            owner.waitingForSignal = true;
+            owner.status = RouteStatus.Pending;
+            owner.message = "Held for nearer train on " + route.id + ".";
+            return true;
+        }
+
+        /// Whether the train holding a locked crossing has stopped closing on it
+        /// for long enough that it should give it up.
+        ///
+        /// Only ever asked when someone else wants the crossing, so a train
+        /// standing at a signal on a railway nobody else is using is left alone.
+        /// The lock is dropped here rather than by the holder, which by
+        /// definition is not running its own arbitration while it sits still.
+        private static bool LockHasGoneStale(TrainRoute owner, JunctionSetting ownerSetting)
+        {
+            var distance = DistanceToJunction(owner, ownerSetting);
+            if (float.IsPositiveInfinity(owner.lockedDistance)
+                || distance + JunctionPriorityHysteresisMeters < owner.lockedDistance)
+            {
+                owner.lockedDistance = distance;
+                owner.lockedSince = Time.time;
+                return false;
+            }
+            if (Time.time - owner.lockedSince < ApproachLockStaleSeconds)
+                return false;
+            owner.approachLocked.Remove(ownerSetting.junction);
+            owner.lockedDistance = float.PositiveInfinity;
+            return true;
+        }
+
+        /// Whether any other live road wants this junction lying the other way,
+        /// whoever holds it at the moment.
+        ///
+        /// A junction only two roads want set the same way is not contested:
+        /// one position satisfies both, and holding it neutral would stop two
+        /// trains that were never in each other's way.
+        private static bool OthersWant(TrainRoute route, JunctionSetting setting)
+        {
+            foreach (var other in routes.Values)
+            {
+                if (other == route || other.status == RouteStatus.Failed
+                    || other.status == RouteStatus.Cleared)
+                    continue;
+                foreach (var otherSetting in other.settings)
+                {
+                    if (otherSetting.junction != setting.junction
+                        || otherSetting.pathIndex < other.progressIndex)
+                        continue;
+                    if (otherSetting.branch != setting.branch)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// Whether some other road wanting this crossing the other way stands
+        /// meaningfully nearer to it than this one.
+        private static bool AnotherIsNearer(
+            TrainRoute route, JunctionSetting setting, float distance)
+        {
+            foreach (var other in routes.Values)
+            {
+                if (other == route || other.status == RouteStatus.Failed
+                    || other.status == RouteStatus.Cleared)
+                    continue;
+                var otherSetting = FutureSettings(other)
+                    .FirstOrDefault(s => s.junction == setting.junction);
+                if (otherSetting == null || otherSetting.branch == setting.branch)
+                    continue;
+                if (DistanceToJunction(other, otherSetting) + JunctionPriorityHysteresisMeters
+                    < distance)
+                    return true;
+            }
+            return false;
+        }
+
+        /// Whether this route may set a contested crossing yet, locking it if so.
+        ///
+        /// The crossing stays as it lies while every claimant is still a long way
+        /// off; the first train to come within the approach distance takes it and
+        /// holds it until it has passed. A road that has stopped closing on a
+        /// crossing it is first in line for takes it anyway after a while, since
+        /// it is usually standing at the signal that protects the crossing and
+        /// can get no nearer until the crossing is set.
+        private static bool ClaimApproach(TrainRoute route, JunctionSetting setting)
+        {
+            if (route.approachLocked.Contains(setting.junction))
+                return true;
+
+            var distance = DistanceToJunction(route, setting);
+            if (distance > ApproachLockMeters)
+            {
+                if (route.approachHeld != setting.junction)
+                {
+                    route.approachHeld = setting.junction;
+                    route.approachHeldSince = Time.time;
+                    route.approachHeldDistance = distance;
+                    return false;
+                }
+                if (distance + JunctionPriorityHysteresisMeters < route.approachHeldDistance)
+                {
+                    // Still closing, so there is no deadlock to break.
+                    route.approachHeldDistance = distance;
+                    route.approachHeldSince = Time.time;
+                    return false;
+                }
+                if (Time.time - route.approachHeldSince < ApproachHoldTimeoutSeconds)
+                    return false;
+                // Breaking the deadlock is still the nearer train's right, or
+                // the crossing would go to whichever road happened to be walked
+                // first this tick.
+                if (AnotherIsNearer(route, setting, distance))
+                    return false;
+            }
+
+            route.approachLocked.Add(setting.junction);
+            route.approachHeld = null;
+            return true;
         }
 
         /// Approximate along-road distance from the leading occupied route
@@ -1038,8 +1370,8 @@ namespace DvMod.RemoteDispatch
             if (setting.pathIndex < route.progressIndex)
                 return float.PositiveInfinity;
 
-            var trainset = Trainset.allSets?.Find(set => set != null && set.id == route.trainsetId);
-            var occupied = new HashSet<RailTrack>();
+            var trainset = FindTrainset(route.trainsetId);
+            var occupied = distanceScratch;
             Occupancy.TracksOccupiedBy(trainset, occupied);
 
             var frontIndex = Mathf.Clamp(route.progressIndex, 0, setting.pathIndex);
@@ -1117,6 +1449,11 @@ namespace DvMod.RemoteDispatch
 
         private static void UpdateStatus(TrainRoute route)
         {
+            // A road that failed keeps the reason it failed. Recomputing a
+            // status from an empty path would report it as set instead.
+            if (route.status == RouteStatus.Failed)
+                return;
+
             // Anything already said about how the road was chosen is kept, since
             // this used to overwrite it and hide notices entirely.
             var notice = route.notice;
@@ -1149,8 +1486,11 @@ namespace DvMod.RemoteDispatch
                 // protecting the crossing and waits there rather than being
                 // refused the whole road.
                 route.status = RouteStatus.Pending;
-                route.message = prefix + "Road set as far as the crossing, held short of "
-                    + route.heldShortOf + ". It will be extended when that route clears.";
+                route.message = prefix + (route.heldForApproach
+                    ? "Road set up to the crossing ahead. The crossing is interlocked and"
+                        + " stays as it lies until a train is close enough to claim it."
+                    : "Road set as far as the crossing, held short of " + route.heldShortOf
+                        + ". It will be extended when that route clears.");
                 return;
             }
             route.message = route.waitingForSignal
@@ -1215,18 +1555,58 @@ namespace DvMod.RemoteDispatch
                     if (reservations.TryGetValue(setting.junction, out var owner) && owner == route.id)
                         reservations.Remove(setting.junction);
                     route.pending.Remove(setting.junction);
+                    if (route.approachLocked.Remove(setting.junction))
+                        route.lockedDistance = float.PositiveInfinity;
                 }
                 route.releasedUpTo = rearmost;
             }
 
             if (route.progressIndex >= route.pathTracks.Count - 1)
             {
-                route.message = "Arrived at " + route.destinationTrackId + ".";
+                if (AdvanceToNextStop(route))
+                    return;
+                route.message = "Arrived at "
+                    + RouteDestination.Describe(route.destinationTrackId) + ".";
                 ClearRoute(route.id);
                 return;
             }
             if (moved)
                 Sessions.AddTag("routes");
+        }
+
+        /// Lay the next leg of a road that calls at more than one place.
+        ///
+        /// The same route entry is kept rather than a new one booked, so the
+        /// train is not shown a fresh road at every call and the stops still to
+        /// come are not lost. Returns false when this was the last stop, which
+        /// is the caller's cue to finish the road.
+        private static bool AdvanceToNextStop(TrainRoute route)
+        {
+            if (route.stopIndex + 1 >= route.stops.Count)
+                return false;
+            var trainset = FindTrainset(route.trainsetId);
+            if (trainset == null)
+                return false;
+
+            var arrivedAt = RouteDestination.Describe(route.destinationTrackId);
+            ReleaseAllocation(route);
+            route.ResetLeg();
+            route.stopIndex++;
+            route.destinationTrackId = route.stops[route.stopIndex];
+
+            var stopLabel = "Stop " + (route.stopIndex + 1) + " of " + route.stops.Count;
+            if (!PlanLeg(route, trainset, allowReversal: true))
+            {
+                // Held in the table rather than dropped: the train has arrived
+                // somewhere real, and the driver needs to see why the rest of
+                // the itinerary cannot be run from there.
+                route.message = "Arrived at " + arrivedAt + ". " + route.message;
+                return true;
+            }
+            route.notice = stopLabel + ", after " + arrivedAt + ". ";
+            TryActivate(route);
+            Sessions.AddTag("routes");
+            return true;
         }
 
         /// How long a train may be off its road before the route is recomputed,
@@ -1235,24 +1615,10 @@ namespace DvMod.RemoteDispatch
         public const float OffRouteGraceSeconds = 3f;
         public const int MaxReroutes = 5;
 
-        public static RailTrack? FindTrack(string trackId)
-        {
-            foreach (var track in FindTracks(trackId))
-                return track;
-            return null;
-        }
-
-        public static IEnumerable<RailTrack> FindTracks(string trackId)
-        {
-            foreach (var track in Component.FindObjectsOfType<RailTrack>())
-            {
-                var logicTrack = track == null ? null : track.LogicTrack();
-                if (logicTrack == null)
-                    continue;
-                if (logicTrack.ID.FullDisplayID == trackId || logicTrack.ID.FullID == trackId)
-                    yield return track!;
-            }
-        }
+        /// Tracks carrying an ID, in either the canonical or the display form.
+        /// A lookup, not a scan: see TrackCatalog.
+        public static IEnumerable<RailTrack> FindTracks(string trackId) =>
+            TrackCatalog.WithId(trackId);
 
         /// Re-assert the road ahead. A junction can be thrown by hand, or by
         /// another route that outranked this one, after the road was set; without
@@ -1289,19 +1655,22 @@ namespace DvMod.RemoteDispatch
                 return;
             }
 
-            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
-            var destination = FindTrack(route.destinationTrackId);
-            if (trainset == null || destination == null)
+            var trainset = FindTrainset(route.trainsetId);
+            if (trainset == null || !RouteDestination.Exists(route.destinationTrackId))
             {
                 ClearRoute(route.id);
                 return;
             }
 
-            var destinationId = route.destinationTrackId;
+            // The stops still to come travel with the replacement, so a train
+            // that wanders off its road part way through an itinerary is put
+            // back on it rather than losing everything after the current leg.
+            var stops = route.stops;
+            var startStop = route.stopIndex;
             var attempts = route.rerouteCount + 1;
             ClearRoute(route.id);
 
-            var replacement = SetRoute(trainset, destination, destinationId);
+            var replacement = SetRoute(trainset, stops, startStop: startStop);
             replacement.rerouteCount = attempts;
             if (replacement.status != RouteStatus.Failed)
                 replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
@@ -1330,8 +1699,11 @@ namespace DvMod.RemoteDispatch
 
                 // Loose cars on the selected destination are an intentional
                 // coupling target. Any through-track occupancy, or a powered
-                // train at the destination, is an obstruction.
-                var isDestination = i == route.pathTracks.Count - 1;
+                // train at the destination, is an obstruction. A junction stop
+                // has no such target: its last track is a running line that the
+                // train is only being brought up to.
+                var isDestination = i == route.pathTracks.Count - 1
+                    && !RouteDestination.IsJunction(route.destinationTrackId);
                 if (isDestination && !powered.Contains(track))
                     continue;
                 return track;
@@ -1370,9 +1742,8 @@ namespace DvMod.RemoteDispatch
                 return true;
             route.nextObstructionRerouteTime = Time.time + ObstructionRetrySeconds;
 
-            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
-            var destination = FindTrack(route.destinationTrackId);
-            if (trainset == null || destination == null)
+            var trainset = FindTrainset(route.trainsetId);
+            if (trainset == null || !RouteDestination.Exists(route.destinationTrackId))
                 return true;
 
             // Remove the old route from conflict consideration while testing a
@@ -1383,7 +1754,7 @@ namespace DvMod.RemoteDispatch
             // expensive reversal search every retry would hitch the host and
             // could instruct a moving train to change ends unexpectedly.
             var replacement = SetRoute(
-                trainset, destination, route.destinationTrackId, allowReversal: false);
+                trainset, route.stops, allowReversal: false, startStop: route.stopIndex);
             if (replacement.status != RouteStatus.Failed)
             {
                 replacement.rerouteCount = route.rerouteCount + 1;
@@ -1409,13 +1780,23 @@ namespace DvMod.RemoteDispatch
         /// and forth continuously. Only the earliest requirement still ahead of
         /// the train is held; the later one takes over once the train has passed
         /// the first.
-        private static IEnumerable<JunctionSetting> PendingSettings(TrainRoute route)
+        private static IEnumerable<JunctionSetting> PendingSettings(TrainRoute route) =>
+            SettingsAhead(route, route.allocatedUpTo);
+
+        /// Everything the road still asks of the junctions ahead of the train,
+        /// whether or not the allocation reaches that far. What arbitration
+        /// looks at, since a route held short of a crossing has to keep seeing
+        /// the crossing it is held short of.
+        private static IEnumerable<JunctionSetting> FutureSettings(TrainRoute route) =>
+            SettingsAhead(route, int.MaxValue);
+
+        private static IEnumerable<JunctionSetting> SettingsAhead(TrainRoute route, int limit)
         {
             var chosen = new Dictionary<Junction, JunctionSetting>();
             foreach (var setting in route.settings)
             {
                 if (setting.junction == null || setting.pathIndex < route.progressIndex
-                    || setting.pathIndex >= route.allocatedUpTo)
+                    || setting.pathIndex >= limit)
                     continue;
                 if (chosen.TryGetValue(setting.junction, out var existing)
                     && existing.pathIndex <= setting.pathIndex)
@@ -1439,7 +1820,7 @@ namespace DvMod.RemoteDispatch
             if (route.pathTracks.Count < 2)
                 return;
 
-            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var trainset = FindTrainset(route.trainsetId);
             if (trainset == null)
                 return;
 
@@ -1712,6 +2093,8 @@ namespace DvMod.RemoteDispatch
             new JProperty("id", route.id),
             new JProperty("trainsetId", route.trainsetId),
             new JProperty("destinationTrack", route.destinationTrackId),
+            new JProperty("stops", new JArray(route.stops)),
+            new JProperty("stopIndex", route.stopIndex),
             new JProperty("status", route.status.ToString()),
             new JProperty("message", route.message),
             new JProperty("priority", route.priority),

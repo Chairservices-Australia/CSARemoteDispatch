@@ -104,10 +104,38 @@ namespace DvMod.RemoteDispatch
         private static Vector3 lastScanPosition;
         private static bool scannedOnce;
         private static float nextForcedScanTime;
+
+        /// The interval currently used for a scan that nothing else asked for.
+        /// Backed off while scans keep finding nothing, so standing still in
+        /// country already covered does not cost a world scan every minute.
+        private static float forcedRescanSeconds = ForcedRescanSeconds;
         private static float nextTrackGridRebuildTime;
         private static int unmatchedSinceGridBuild;
 
         public static int KnownCount => known.Count;
+
+        /// What discovery made of the sign at this position and entry index:
+        /// the track it was put on, or why it was not. Reported by the /signs
+        /// endpoint, which exists to answer "why is that limit not showing".
+        public static bool TryDescribePlacement(Vector3 position, int index, out string description)
+        {
+            var key = new SignKey(position, index);
+            if (known.TryGetValue(key, out var sign))
+            {
+                var logicTrack = sign.track == null ? null : sign.track.LogicTrack();
+                description = "on " + (logicTrack == null
+                        ? "an unnamed track" : logicTrack.ID.FullDisplayID)
+                    + " at " + Mathf.RoundToInt(sign.trackPosition) + " m";
+                return true;
+            }
+            if (unplaceable.Contains(key))
+            {
+                description = "no track near enough, or none facing the right way";
+                return false;
+            }
+            description = "not a speed limit, or not yet scanned";
+            return false;
+        }
 
         public static void Reset()
         {
@@ -119,6 +147,7 @@ namespace DvMod.RemoteDispatch
             lastScanPosition = Vector3.zero;
             scannedOnce = false;
             nextForcedScanTime = 0f;
+            forcedRescanSeconds = ForcedRescanSeconds;
             nextTrackGridRebuildTime = 0f;
             unmatchedSinceGridBuild = 0;
         }
@@ -145,7 +174,10 @@ namespace DvMod.RemoteDispatch
 
                 scannedOnce = true;
                 lastScanPosition = origin;
-                nextForcedScanTime = Time.time + ForcedRescanSeconds;
+                // Set before the work, not after, so a pass spread over several
+                // frames cannot immediately ask for another.
+                nextForcedScanTime = Time.time + forcedRescanSeconds;
+                var knownBefore = known.Count;
 
                 // The rail network is effectively static, so the grid is built
                 // once. It is only reconsidered when a pass found signs that no
@@ -154,7 +186,11 @@ namespace DvMod.RemoteDispatch
                 if (trackGrid.Count == 0
                     || (unmatchedSinceGridBuild > 0 && Time.time >= nextTrackGridRebuildTime))
                 {
-                    var tracks = UnityEngine.Object.FindObjectsOfType<RailTrack>();
+                    // A rebuild is triggered by signs no known track could
+                    // claim, which is what newly streamed-in railway looks
+                    // like, so this is the moment to look for it.
+                    TrackCatalog.RefreshIfStale();
+                    var tracks = TrackCatalog.All;
                     trackGrid.Clear();
                     unplaceable.Clear();
                     unmatchedSinceGridBuild = 0;
@@ -174,6 +210,18 @@ namespace DvMod.RemoteDispatch
                     if ((i + 1) % SignComponentsPerFrame == 0)
                         yield return null;
                 }
+
+                // Finding every object of a type is one of the most expensive
+                // things Unity offers and cannot be spread over frames, so a
+                // pass that turns nothing up is a hitch bought for nothing.
+                // Travelling still triggers a scan on its own; this is only the
+                // backstop for signs streaming in where the player already is,
+                // so it gives ground as it keeps finding none and returns to
+                // the short interval the moment a scan pays off.
+                forcedRescanSeconds = known.Count != knownBefore
+                    ? ForcedRescanSeconds
+                    : Mathf.Min(forcedRescanSeconds * 2f, MaxForcedRescanSeconds);
+                nextForcedScanTime = Time.time + forcedRescanSeconds;
             }
         }
 
@@ -434,6 +482,9 @@ namespace DvMod.RemoteDispatch
         /// A floor, so a player who never moves far still picks up signs that
         /// streamed in around them.
         private const float ForcedRescanSeconds = 60f;
+
+        /// The longest the backstop scan is allowed to stretch to.
+        private const float MaxForcedRescanSeconds = 480f;
 
         /// The soonest the track grid may be built a second time, however many
         /// signs go unplaced in the meantime.

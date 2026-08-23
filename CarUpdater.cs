@@ -5,6 +5,8 @@ using DV.Simulation.Controllers;
 using DV.ThingTypes;
 using DV.Utils;
 using HarmonyLib;
+using System;
+using System.Collections.Generic;
 using System.Linq;
 
 namespace DvMod.RemoteDispatch
@@ -45,10 +47,24 @@ namespace DvMod.RemoteDispatch
             }
         }
 
+        /// Update tag for each consist, and the test for whether it has anything
+        /// worth reporting, both kept rather than made afresh.
+        ///
+        /// This runs ten times a second for every moving consist. Building the
+        /// tag string each time, and converting the method group to a predicate
+        /// each time, made garbage at that rate for no reason - and garbage at
+        /// that rate is collected during play, which is felt as a stutter.
+        private static readonly Dictionary<int, string> trainsetTags =
+            new Dictionary<int, string>();
+        private static readonly Predicate<TrainCar> shouldReturn = CarData.ShouldReturnTrainCar;
+
         public static void MarkTrainsetAsDirty(Trainset trainset)
         {
-            if (trainset.cars.Find(CarData.ShouldReturnTrainCar) != null)
-                Sessions.AddTag($"trainset-{trainset.id}");
+            if (trainset.cars.Find(shouldReturn) == null)
+                return;
+            if (!trainsetTags.TryGetValue(trainset.id, out var tag))
+                trainsetTags[trainset.id] = tag = "trainset-" + trainset.id;
+            Sessions.AddTag(tag);
         }
 
         public static void Start()

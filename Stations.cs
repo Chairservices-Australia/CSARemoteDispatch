@@ -10,13 +10,31 @@ namespace DvMod.RemoteDispatch
     /// and the station colour used on in-game signage and job overviews.
     public static class Stations
     {
+        private static string? stationJSON;
+        private static int cachedTrackVersion = -1;
+
+        /// Building this walks every station's tracks and resamples the geometry
+        /// of each one to find the yard centre, which is far too much to repeat
+        /// per browser request - a page reload or a second client used to pay
+        /// for it again. It is kept until the set of tracks itself changes, so
+        /// modded and streamed-in yards still appear.
         public static string GetStationJSON()
         {
             if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
                 throw new System.Exception("World not yet loaded");
-            // Do not cache: modded tracks and streamed station content can be
-            // registered after the first browser request.
-            return JsonConvert.SerializeObject(GetStationData());
+            TrackCatalog.RefreshIfStale();
+            if (stationJSON == null || cachedTrackVersion != TrackCatalog.Version)
+            {
+                stationJSON = JsonConvert.SerializeObject(GetStationData());
+                cachedTrackVersion = TrackCatalog.Version;
+            }
+            return stationJSON;
+        }
+
+        public static void ResetCache()
+        {
+            stationJSON = null;
+            cachedTrackVersion = -1;
         }
 
         private static JArray GetStationData()
@@ -25,13 +43,22 @@ namespace DvMod.RemoteDispatch
                 .Where(station => station != null && station.StationInfoValid)
                 .ToList();
 
-            var allTracks = Component.FindObjectsOfType<RailTrack>()
-                .Where(track => track != null && track.LogicTrack() != null)
-                .ToList();
-            var tracksByYard = allTracks
-                .GroupBy(track => YardIdOf(track.LogicTrack().ID.FullDisplayID))
-                .Where(group => !string.IsNullOrEmpty(group.Key))
-                .ToDictionary(group => group.Key, group => group.ToList());
+            // One LogicTrack() call per track, not three: it is a lookup through
+            // the game's own registry and this runs over every track in the
+            // world.
+            var tracksByYard = new Dictionary<string, List<RailTrack>>();
+            foreach (var track in TrackCatalog.All)
+            {
+                var logicTrack = track == null ? null : track.LogicTrack();
+                if (logicTrack == null)
+                    continue;
+                var yardId = YardIdOf(logicTrack.ID.FullDisplayID);
+                if (string.IsNullOrEmpty(yardId))
+                    continue;
+                if (!tracksByYard.TryGetValue(yardId, out var group))
+                    tracksByYard[yardId] = group = new List<RailTrack>();
+                group.Add(track!);
+            }
 
             var result = new JArray();
             var represented = new HashSet<string>();
@@ -84,19 +111,27 @@ namespace DvMod.RemoteDispatch
                 new JProperty("tracks", new JArray(TrackIdsOf(tracks))));
         }
 
-        /// Yard centre: the mean of every sampled point on the station's tracks.
+        /// Yard centre: the mean of the points defining the station's tracks.
         /// Preferred over the station office transform, which sits off to one
         /// side of larger yards and would drag the label away from the track.
+        ///
+        /// Read straight off each curve rather than from a resampled point set.
+        /// Resampling every track of every yard is by far the most expensive
+        /// part of building this list, and it buys nothing here: what comes out
+        /// is one rough centre for a label, which the curve's own points give
+        /// to well within the size of the yard.
         private static World.Position? CenterOf(IEnumerable<RailTrack> tracks)
         {
             double x = 0, z = 0;
             var count = 0;
             foreach (var track in tracks)
             {
-                if (track == null)
+                var curve = track == null ? null : track.curve;
+                if (curve == null)
                     continue;
-                foreach (var point in RailTracks.GetTrackPoints(track))
+                for (var i = 0; i < curve.pointCount; i++)
                 {
+                    var point = curve[i].position;
                     x += point.x;
                     z += point.z;
                     count++;

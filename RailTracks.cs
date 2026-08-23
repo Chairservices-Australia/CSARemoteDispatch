@@ -3,6 +3,7 @@ using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 using System.Collections.Generic;
 using System.Linq;
+using System.Collections;
 using System.Threading.Tasks;
 using System;
 using UnityEngine;
@@ -55,18 +56,6 @@ namespace DvMod.RemoteDispatch
 
         private static IEnumerable<World.LatLon> NormalizeTrackPoints(IEnumerable<World.Position> positions) => positions.Select(p => p.ToLatLon());
 
-        public static Dictionary<RailTrack, IEnumerable<World.LatLon>> GetNormalizedTrackCoordinates() =>
-            GetAllTrackPoints().ToDictionary(kvp => kvp.Key, kvp => NormalizeTrackPoints(kvp.Value));
-
-        public static Dictionary<RailTrack, IEnumerable<World.Position>> GetAllTrackPoints(float resolution = SIMPLIFIED_RESOLUTION)
-        {
-            if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
-                throw new Exception("World not yet loaded");
-            var tracks = Component.FindObjectsOfType<RailTrack>();
-            Main.DebugLog(() => $"Found {tracks.Length} RailTracks.");
-            return tracks.ToDictionary(track => track, track => GetTrackPoints(track, resolution));
-        }
-
         public static IEnumerable<World.Position> GetTrackPoints(RailTrack track, float resolution = SIMPLIFIED_RESOLUTION)
         {
             var pointSet = track.GetKinkedPointSet();
@@ -79,33 +68,103 @@ namespace DvMod.RemoteDispatch
         }
 
         private static string? trackPointJSON;
-        private static int cachedTrackCount = -1;
+        private static int cachedTrackVersion = -1;
 
-        private static string GenerateTrackPointJSON(RailTrack[] tracks)
-        {
-            return JsonConvert.SerializeObject(
-                tracks.ToDictionary(
-                    track => track.LogicTrack().ID,
-                    track => NormalizeTrackPoints(GetTrackPoints(track)).Select(ll => ll.ToJson())));
-        }
+        /// Tracks resampled per frame while the map's geometry is built.
+        private const int TracksPerFrame = 64;
 
+        private static Task<string>? generation;
+
+        /// The geometry the map is drawn from.
+        ///
+        /// Producing it resamples the curve of every track in the world, which
+        /// takes far longer than one frame is worth: doing it inline froze the
+        /// game for as long as it took, every time a page was opened. It is
+        /// built a slice at a time instead, and kept until the set of tracks
+        /// itself changes. The request waits; the game does not.
+        ///
+        /// Must be called from the game thread. Callers on an HTTP thread reach
+        /// it through Updater.RunOnMainThread and await the task it returns.
         public static Task<string> GetTrackPointJSON()
         {
             if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
                 throw new Exception("World not yet loaded");
-            var tracks = Component.FindObjectsOfType<RailTrack>();
-            if (trackPointJSON == null || cachedTrackCount != tracks.Length)
+            TrackCatalog.RefreshIfStale();
+            if (trackPointJSON != null && cachedTrackVersion == TrackCatalog.Version)
+                return Task.FromResult(trackPointJSON);
+            // Several pages opening at once share one build rather than each
+            // starting another pass over every track in the world.
+            if (generation != null)
+                return generation;
+
+            var completion = new TaskCompletionSource<string>();
+            generation = completion.Task;
+            if (!Updater.RunSliced(GenerateTrackPointCoroutine(completion)))
             {
-                trackPointJSON = GenerateTrackPointJSON(tracks);
-                cachedTrackCount = tracks.Length;
+                generation = null;
+                completion.SetException(new Exception("The mod is shutting down."));
             }
-            return Task.FromResult(trackPointJSON);
+            return completion.Task;
+        }
+
+        private static IEnumerator GenerateTrackPointCoroutine(
+            TaskCompletionSource<string> completion)
+        {
+            var tracks = TrackCatalog.All;
+            var version = TrackCatalog.Version;
+            var points = new Dictionary<string, List<JToken>>();
+            Exception? failure = null;
+
+            for (var i = 0; i < tracks.Length; i++)
+            {
+                // No yield inside the try, so this stays a legal iterator; a
+                // track that cannot be read must not leave the waiting request
+                // hanging for ever.
+                try
+                {
+                    var track = tracks[i];
+                    var logicTrack = track == null ? null : track.LogicTrack();
+                    if (logicTrack != null)
+                    {
+                        points[logicTrack.ID.ToString()] = NormalizeTrackPoints(
+                            GetTrackPoints(track!)).Select(ll => ll.ToJson()).ToList();
+                    }
+                }
+                catch (Exception e)
+                {
+                    failure = e;
+                    break;
+                }
+                if ((i + 1) % TracksPerFrame == 0)
+                    yield return null;
+            }
+
+            // A world reload part way through leaves this holding geometry for
+            // tracks that no longer exist, and may already have started a
+            // replacement. Answer the request that is waiting, but only publish
+            // to the cache if what was built still describes the world.
+            if (generation == completion.Task)
+                generation = null;
+            if (failure != null)
+            {
+                completion.SetException(failure);
+                yield break;
+            }
+            var json = JsonConvert.SerializeObject(points);
+            if (version == TrackCatalog.Version)
+            {
+                trackPointJSON = json;
+                cachedTrackVersion = version;
+            }
+            completion.SetResult(json);
         }
 
         public static void ResetCache()
         {
             trackPointJSON = null;
-            cachedTrackCount = -1;
+            cachedTrackVersion = -1;
+            generation = null;
+            TrackCatalog.Invalidate();
             Junctions.ResetCache();
         }
     }

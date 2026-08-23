@@ -359,9 +359,10 @@ function jobMatchesFilter(jobId, jobData) {
   return fields.some(field => field.includes(testText)) && (!activeOnly || jobData.isActive);
 }
 
-function jobElem(jobId, jobData) {
-  function replaceHyphens(s) { return s.replaceAll('-', '\u2011'); }
+// Non-breaking hyphens, so a track ID is never split across two lines.
+function replaceHyphens(s) { return s.replaceAll('-', '\u2011'); }
 
+function jobElem(jobId, jobData) {
   const tbody = document.createElement('tbody');
   tbody.setAttribute('id', `jobList-${jobId}`);
 
@@ -663,6 +664,72 @@ const routeStationSelect = document.getElementById('routeStationSelect');
 const routeTrackSelect = document.getElementById('routeTrackSelect');
 const routeMessage = document.getElementById('routeMessage');
 const routeListBody = document.getElementById('routeListBody');
+const routeStopList = document.getElementById('routeStopList');
+
+// The itinerary being built, before it is sent. Each entry is { id, label }:
+// the id is what the host routes to - a track ID or a junction like "J-482" -
+// and the label is what the player picked it by. Empty means the road is the
+// single destination currently selected above, so the one-click case that was
+// here before still works untouched.
+const maxStops = 12;   // matches RouteDestination.MaxStops on the host
+let plannedStops = [];
+
+function stopLabelFor(id) {
+  const planned = plannedStops.find(stop => stop.id === id);
+  if (planned)
+    return planned.label;
+  if (/^J-\d+$/.test(id))
+    return `Junction ${id.slice(2)}`;
+  return replaceHyphens(id);
+}
+
+function renderPlannedStops() {
+  // A browser holding a cached index.html from before stops existed has no
+  // list to draw into. Routing still works without it, so this gives way
+  // rather than throwing and taking the rest of the page's script with it.
+  if (!routeStopList)
+    return;
+  routeStopList.innerHTML = '';
+  for (const [index, stop] of plannedStops.entries()) {
+    const item = document.createElement('li');
+    const label = document.createElement('span');
+    label.textContent = stop.label;
+    item.appendChild(label);
+
+    const remove = document.createElement('button');
+    remove.textContent = '×';
+    remove.title = 'Remove this stop';
+    remove.className = 'routeStopRemove';
+    remove.addEventListener('click', () => {
+      plannedStops.splice(index, 1);
+      renderPlannedStops();
+    });
+    item.appendChild(remove);
+    routeStopList.appendChild(item);
+  }
+  routeStopList.classList.toggle('empty', plannedStops.length === 0);
+}
+
+// Calling twice at the same place in a row is a leg of no length, which would
+// arrive the moment it was planned, so a repeat of the stop before is dropped.
+function addPlannedStop(id, label) {
+  if (!id)
+    return;
+  if (plannedStops.length >= maxStops) {
+    routeMessage.textContent = `A road may call at up to ${maxStops} places.`;
+    return;
+  }
+  const last = plannedStops[plannedStops.length - 1];
+  if (last && last.id === id) {
+    routeMessage.textContent = `${label} is already the last stop.`;
+    return;
+  }
+  plannedStops.push({ id, label });
+  renderPlannedStops();
+  routeMessage.textContent = plannedStops.length === 1
+    ? `Stop added. Add more, or press Set route.`
+    : `${plannedStops.length} stops booked.`;
+}
 
 function fillSelect(select, entries, keepValue) {
   const previous = keepValue ? select.value : null;
@@ -739,7 +806,11 @@ function routeColor(route) {
 function routeOrder(route) {
   return Number.isInteger(route.sequence) ? route.sequence : 0;
 }
-const highlightedTracks = new Set();
+// What colour each highlighted track is currently drawn in, so a redraw only
+// touches the ones that changed. Restyling a whole road every second - and
+// bringing each of its tracks to the front, which reorders the canvas each
+// time - was quadratic work for a picture that had usually not moved.
+let highlightedTracks = new Map();
 
 function baseTrackColor(trackId) {
   // Matches how the track layer is drawn: yard tracks are named, plain line
@@ -766,15 +837,20 @@ function applyRouteHighlight(routes) {
     }
   }
 
-  for (const trackId of highlightedTracks) {
+  const releasedJunctions = new Set();
+  for (const trackId of highlightedTracks.keys()) {
     if (colorByTrack.has(trackId))
       continue;
     const polyline = trackPolyLines.get(trackId);
     if (polyline)
       polyline.setStyle({ color: baseTrackColor(trackId), weight: 3 });
+    for (const junctionId of junctionsByBranchTrack.get(trackId) || [])
+      releasedJunctions.add(junctionId);
   }
 
   for (const [trackId, color] of colorByTrack) {
+    if (highlightedTracks.get(trackId) === color)
+      continue;
     const polyline = trackPolyLines.get(trackId);
     if (!polyline)
       continue;
@@ -782,9 +858,12 @@ function applyRouteHighlight(routes) {
     polyline.bringToFront();
   }
 
-  highlightedTracks.clear();
-  for (const trackId of colorByTrack.keys())
-    highlightedTracks.add(trackId);
+  highlightedTracks = colorByTrack;
+
+  // Last, so a branch a road has just let go shows which way its switch lies
+  // rather than the plain track colour.
+  for (const junctionId of releasedJunctions)
+    repaintJunction(junctionId);
 }
 
 function appendCell(row, text) {
@@ -813,7 +892,18 @@ function renderRoutes(routes) {
 
     appendCell(row, route.trainsetId);
     appendCell(row, route.requestedBy || 'Local');
-    appendCell(row, route.destinationTrack);
+
+    // A road calling at several places shows where it is going now and how far
+    // through the itinerary that is, since only the leg in hand is on the map.
+    const stops = Array.isArray(route.stops) ? route.stops : [];
+    const destination = appendCell(row, stopLabelFor(route.destinationTrack));
+    if (stops.length > 1) {
+      const progress = document.createElement('span');
+      progress.className = 'routeStopProgress';
+      progress.textContent = ` ${(route.stopIndex || 0) + 1}/${stops.length}`;
+      destination.appendChild(progress);
+      destination.title = 'Calling at ' + stops.map(stopLabelFor).join(', ');
+    }
     // Built as text rather than interpolated markup: track and signal names
     // come from the world and from other mods, and a quote in one of them used
     // to break out of the title attribute.
@@ -863,6 +953,20 @@ function clearRoute(routeId) {
 let autoDetectedTrainGuid = null;
 let autoAppliedTrainGuid = null;      // the last one actually selected
 let autoDestinationTrack = null;
+
+// Every place the detected job asks for, in order. Offered rather than applied:
+// booking it would throw away an itinerary the dispatcher had built by hand.
+let autoJobStops = [];
+
+function updateUseJobButton() {
+  const button = document.getElementById('routeUseJobButton');
+  if (!button)
+    return;
+  button.hidden = autoJobStops.length === 0;
+  button.textContent = autoJobStops.length > 1
+    ? `Use job route (${autoJobStops.length} stops)`
+    : 'Use job route';
+}
 
 function selectStationForTrack(trackDisplayId) {
   for (const [yardId, tracks] of stationTracks) {
@@ -914,6 +1018,8 @@ function refreshCurrentTrain() {
         autoDetectedTrainGuid = null;
         autoAppliedTrainGuid = null;
         autoDestinationTrack = null;
+        autoJobStops = [];
+        updateUseJobButton();
         if (status)
           status.textContent = 'Not aboard a train.';
         return;
@@ -925,50 +1031,120 @@ function refreshCurrentTrain() {
       }
       autoDetectedTrainGuid = current.carGuid;
       autoDestinationTrack = current.destinationTrack || null;
+      autoJobStops = Array.isArray(current.stops) ? current.stops : [];
       applyAutoSelection();
+      updateUseJobButton();
 
       if (status) {
         const parts = [`Aboard ${current.carId}`];
         if (current.jobId)
           parts.push(`job ${current.jobId}`);
-        parts.push(current.destinationTrack
-          ? `to ${current.destinationTrack}`
-          : (current.jobId ? 'no destination track on job' : 'no job'));
+        // A job worked by cars behind the loco is the normal case, so say how
+        // many were found rather than leaving "no job" to look like a fault.
+        const otherJobs = (current.jobs || []).length - (current.jobId ? 1 : 0);
+        if (autoJobStops.length > 1)
+          parts.push(`${autoJobStops.length} calls, ending ${current.destinationTrack}`);
+        else if (current.destinationTrack)
+          parts.push(`to ${current.destinationTrack}`);
+        else
+          parts.push(current.jobId ? 'no destination track on job' : 'no job on this train');
+        if (otherJobs > 0)
+          parts.push(`+${otherJobs} other job${otherJobs > 1 ? 's' : ''} aboard`);
         status.textContent = parts.join(' – ');
       }
     })
     .catch(() => {});
 }
 
+const routeUseJobButton = document.getElementById('routeUseJobButton');
+if (routeUseJobButton) {
+  routeUseJobButton.addEventListener('click', () => {
+    const booked = autoJobStops.slice(0, maxStops);
+    plannedStops = [];
+    plannedStops = booked.map(id => ({ id, label: stopLabelFor(id) }));
+    renderPlannedStops();
+    routeMessage.textContent = booked.length < autoJobStops.length
+      ? `Booked the first ${booked.length} of the job's ${autoJobStops.length} calls;`
+        + ` a road may call at up to ${maxStops} places.`
+      : `Booked the job's ${booked.length} call${booked.length > 1 ? 's' : ''}.`;
+  });
+}
+
+document.getElementById('routeAddStopButton')
+  .addEventListener('click', () => {
+    const trackId = routeTrackSelect.value;
+    if (!trackId) {
+      routeMessage.textContent = 'Select a track to add as a stop.';
+      return;
+    }
+    const option = routeTrackSelect.selectedOptions[0];
+    addPlannedStop(trackId, option ? option.textContent : replaceHyphens(trackId));
+  });
+
 document.getElementById('routeSetButton')
   .addEventListener('click', () => {
     const trainsetId = routeTrainSelect.value;
-    const trackId = routeTrackSelect.value;
-    if (!trainsetId || !trackId) {
+    // With nothing booked the selected track is the whole road, so choosing a
+    // destination and pressing Set route still needs no extra step.
+    const stops = plannedStops.length > 0
+      ? plannedStops.map(stop => stop.id)
+      : [routeTrackSelect.value].filter(Boolean);
+    if (!trainsetId || stops.length === 0) {
       routeMessage.textContent = 'Select a train and a destination track.';
       return;
     }
     routeMessage.textContent = 'Planning...';
-    fetchJson(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST', body: '' })
+    const itinerary = encodeURIComponent(stops.join('|'));
+    fetchJson(new URL(`/route/${trainsetId}/${itinerary}`, location), { method: 'POST', body: '' })
       .then(route => {
         routeMessage.textContent = route.message || route.status;
+        plannedStops = [];
+        renderPlannedStops();
         refreshRoutes();
       })
       .catch(error => { routeMessage.textContent = error.message || 'Routing failed.'; });
   });
 
+renderPlannedStops();
+updateUseJobButton();
+
 /////////////////////
 // junctions
 
 let junctions = [];
+
+// Which junctions draw each track. A junction branch's colour says which way
+// the switch lies, and a road highlighted over it has to hand that back when
+// it clears - which nothing did, so a cleared road used to leave the branch in
+// the plain track colour until some switch elsewhere happened to repaint it.
+const junctionsByBranchTrack = new Map();
+
 const junctionsReady = tracksReady
 .then(_ => fetchJson(new URL('/junction', location)))
-.then(allJunctionData =>
+.then(allJunctionData => {
   junctions = allJunctionData.map((data, index) => ({
     marker: createJunctionMarker(data.position, index),
     branches: data.branches,
-  }))
-);
+  }));
+  for (const [index, junction] of junctions.entries()) {
+    for (const trackId of junction.branches || []) {
+      if (!junctionsByBranchTrack.has(trackId))
+        junctionsByBranchTrack.set(trackId, []);
+      junctionsByBranchTrack.get(trackId).push(index);
+    }
+  }
+});
+
+// Draw a junction's branches as they currently lie, whatever was drawn over
+// them since.
+function repaintJunction(junctionId) {
+  const junction = junctions[junctionId];
+  if (!junction || junction.selectedBranch === undefined)
+    return;
+  const selected = junction.selectedBranch;
+  junction.selectedBranch = undefined;
+  updateJunctionOverlay(junctionId, selected);
+}
 
 function toggleJunction(junctionId) {
   fetchJson(new URL(`/junction/${junctionId}/toggle`, location), { method: 'POST' })
@@ -1001,20 +1177,84 @@ function createJunctionOverlay(junctionId) {
   return svg;
 }
 
+// Throwing one switch used to redraw every junction on the map: the update
+// carries the state of all of them, and each was re-rendered whether or not it
+// had moved - reparsing its SVG and restyling two polylines apiece. Only the
+// ones that actually changed are touched now.
 function updateJunctionOverlay(junctionId, selectedBranch) {
-  const junction = junctions[junctionId]
+  const junction = junctions[junctionId];
+  if (!junction || junction.selectedBranch === selectedBranch)
+    return;
+  junction.selectedBranch = selectedBranch;
+
   junction.marker.getElement().innerHTML = createJunctionShape(selectedBranch) + createJunctionLabel(junctionId);
-  const selectedTrackId = junction.branches[selectedBranch]
-  trackPolyLines.get(selectedTrackId).setStyle({ color: 'steelblue', dashArray: null });
-  const unselectedTrackPolyLine = trackPolyLines.get(junction.branches[1-selectedBranch]);
-  unselectedTrackPolyLine
-    .setStyle({ color: 'lightsteelblue', dashArray: "6 12" })
-    .bringToBack();
+
+  // A booked road is drawn over its junctions, and outranks them: throwing a
+  // switch under a highlighted road must not paint the road out.
+  const selectedTrackId = junction.branches[selectedBranch];
+  const selectedTrackPolyLine = trackPolyLines.get(selectedTrackId);
+  if (selectedTrackPolyLine && !highlightedTracks.has(selectedTrackId))
+    selectedTrackPolyLine.setStyle({ color: 'steelblue', dashArray: null });
+
+  const unselectedTrackId = junction.branches[1-selectedBranch];
+  const unselectedTrackPolyLine = trackPolyLines.get(unselectedTrackId);
+  if (unselectedTrackPolyLine && !highlightedTracks.has(unselectedTrackId))
+    unselectedTrackPolyLine
+      .setStyle({ color: 'lightsteelblue', dashArray: "6 12" })
+      .bringToBack();
 }
 
 function getJunctionOverlayBounds(position) {
   const size = metersToDegrees * 5;
   return [ [ position[0] - size, position[1] - size/2], [position[0] + size, position[1] + size/2] ];
+}
+
+// A junction is a place a train can be sent, not only a switch to throw: the
+// throat of a yard has no track ID to pick from the list, and running up to it
+// and shunting the rest by hand is often what is actually wanted. Left-click
+// still throws the switch, so nothing that worked before has moved.
+function openJunctionRouteMenu(event, p, junctionId) {
+  // Leaflet hands layer handlers its own event object; the browser's menu is
+  // suppressed on the DOM event inside it.
+  L.DomEvent.preventDefault(event.originalEvent || event);
+  const id = `J-${junctionId}`;
+  const label = `Junction ${junctionId}`;
+  const content = document.createElement('div');
+  content.className = 'junctionMenu';
+
+  const title = document.createElement('div');
+  title.className = 'junctionMenuTitle';
+  title.textContent = label;
+  content.appendChild(title);
+
+  const routeHere = document.createElement('button');
+  routeHere.textContent = 'Route here';
+  routeHere.addEventListener('click', () => {
+    plannedStops = [{ id, label }];
+    renderPlannedStops();
+    map.closePopup();
+    openRoutingTab();
+    document.getElementById('routeSetButton').click();
+  });
+  content.appendChild(routeHere);
+
+  const addStop = document.createElement('button');
+  addStop.textContent = 'Add as stop';
+  addStop.addEventListener('click', () => {
+    addPlannedStop(id, label);
+    map.closePopup();
+    openRoutingTab();
+  });
+  content.appendChild(addStop);
+
+  L.popup({ closeButton: true })
+    .setLatLng([p[0], p[1]])
+    .setContent(content)
+    .openOn(map);
+}
+
+function openRoutingTab() {
+  sidebar.open('routingTab');
 }
 
 function createJunctionMarker(p, junctionId) {
@@ -1023,6 +1263,7 @@ function createJunctionMarker(p, junctionId) {
     getJunctionOverlayBounds(p),
     { interactive: true, renderer: canvasRenderer })
     .addEventListener('click', () => toggleJunction(junctionId) )
+    .addEventListener('contextmenu', e => openJunctionRouteMenu(e, p, junctionId) )
     .addTo(map)
     .setZIndex(Math.floor(p[0] * 100000 + p[1] * 100000));
 }

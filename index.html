@@ -77,6 +77,7 @@
     <div class="leaflet-sidebar-pane" id="routingTab">
       <div id="routingForm">
         <div id="routeCurrentTrain">Not aboard a train.</div>
+        <div id="routeJobActions"><button id="routeUseJobButton" hidden>Use job route</button></div>
         <div>
           <label for="routeTrainSelect">Train</label>
           <select id="routeTrainSelect"></select>
@@ -90,7 +91,13 @@
           <select id="routeTrackSelect"></select>
         </div>
         <div>
+          <button id="routeAddStopButton">Add stop</button>
           <button id="routeSetButton">Set route</button>
+        </div>
+        <ol id="routeStopList"></ol>
+        <div id="routeStopHint">
+          Add stops to call at several places in turn. Right-click a junction on
+          the map to call at the junction itself rather than a platform.
         </div>
         <div id="routeMessage"></div>
       </div>

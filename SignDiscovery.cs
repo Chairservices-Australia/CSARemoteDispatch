@@ -1,54 +1,82 @@
 using System;
-using System.Collections.Generic;
-using System.Linq;
 using Newtonsoft.Json.Linq;
+using DV.Signs;
 using UnityEngine;
 
 namespace DvMod.RemoteDispatch
 {
-    /// Reports the trackside signs present in the loaded world.
+    /// Reports the trackside signs Derail Valley has placed near the player.
     ///
-    /// Derail Valley exposes no speed limit anywhere in its API, so the only way
-    /// to show the limits it actually places is to read the signs themselves.
-    /// This walks the scene rather than guessing from the assemblies, and reads
-    /// text through reflection so no TextMeshPro reference is needed.
+    /// Derail Valley exposes no speed limit anywhere in its API, so the limits
+    /// shown elsewhere in this mod are read from the signs themselves. This is
+    /// the window onto that: it lists what is actually standing beside the line
+    /// and, for each entry on each pole, what sign discovery made of it. When a
+    /// limit is not showing on the HUD, this says whether the sign was never
+    /// seen, was seen and could not be tied to a track, or was placed on one.
+    ///
+    /// It reads SignGeneratorData - the component the game itself puts sign
+    /// content on, and the same source the speed limit reader uses. It used to
+    /// walk every MonoBehaviour in the scene, guess from type and object names
+    /// which ones might be signs, and pull their text out by reflecting over
+    /// every component and field beneath them. That answered the same question
+    /// far less exactly and at a cost that could be felt in the game.
     public static class SignDiscovery
     {
         /// Anything nearer than this to the player, so a scan stays cheap and
         /// returns what is actually around rather than the whole map.
         public const float DefaultRadius = 400f;
 
+        /// Poles reported at most, however wide the radius.
+        private const int MaxPoles = 200;
+
         public static string GetNearbySignsJson(float radius)
         {
             var origin = PlayerOrigin();
             var results = new JArray();
 
-            foreach (var behaviour in UnityEngine.Object.FindObjectsOfType<MonoBehaviour>())
+            foreach (var data in UnityEngine.Object.FindObjectsOfType<SignGeneratorData>())
             {
-                if (behaviour == null)
-                    continue;
-                var typeName = behaviour.GetType().Name;
-                if (!LooksLikeSign(typeName, behaviour.gameObject.name))
+                if (data == null || data.signParameters == null)
                     continue;
 
-                var position = behaviour.transform.position;
-                if (radius > 0f && Vector3.Distance(position, origin) > radius)
+                // The raw transform is what identifies a sign to discovery; the
+                // shifted one is what can be put on the map, since the world
+                // moves under the player over long distances.
+                var position = data.transform.position;
+                var distance = Vector3.Distance(position, origin);
+                if (radius > 0f && distance > radius)
                     continue;
 
+                var entries = new JArray();
+                for (var i = 0; i < data.signParameters.Length; i++)
+                {
+                    var parameters = data.signParameters[i];
+                    var placed = SpeedSigns.TryDescribePlacement(position, i, out var placement);
+                    entries.Add(new JObject(
+                        new JProperty("index", i),
+                        new JProperty("type", parameters.type.ToString()),
+                        new JProperty("text", parameters.signText ?? ""),
+                        new JProperty("placed", placed),
+                        new JProperty("placement", placement)));
+                }
+
+                var moved = position - WorldMover.currentMove;
                 results.Add(new JObject(
-                    new JProperty("component", behaviour.GetType().FullName),
-                    new JProperty("gameObject", behaviour.gameObject.name),
-                    new JProperty("distance", Math.Round(Vector3.Distance(position, origin), 1)),
-                    new JProperty("texts", new JArray(TextsUnder(behaviour.gameObject))),
-                    new JProperty("fields", new JArray(NumericFields(behaviour)))));
+                    new JProperty("gameObject", data.gameObject.name),
+                    new JProperty("distance", Math.Round(distance, 1)),
+                    new JProperty("position",
+                        new World.Position(moved.x, moved.z).ToLatLon().ToJson()),
+                    new JProperty("entries", entries)));
 
-                if (results.Count >= 200)
+                if (results.Count >= MaxPoles)
                     break;
             }
 
             return new JObject(
                 new JProperty("radius", radius),
                 new JProperty("count", results.Count),
+                new JProperty("truncated", results.Count >= MaxPoles),
+                new JProperty("speedSignsKnown", SpeedSigns.KnownCount),
                 new JProperty("signs", results)).ToString(Newtonsoft.Json.Formatting.None);
         }
 
@@ -59,67 +87,6 @@ namespace DvMod.RemoteDispatch
                 return car.transform.position;
             var player = PlayerManager.PlayerTransform;
             return player != null ? player.position : Vector3.zero;
-        }
-
-        private static bool LooksLikeSign(string typeName, string objectName)
-        {
-            return Contains(typeName, "sign") || Contains(typeName, "speed")
-                || Contains(objectName, "sign") || Contains(objectName, "speed")
-                || Contains(objectName, "limit");
-        }
-
-        private static bool Contains(string haystack, string needle) =>
-            haystack != null && haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
-
-        /// Any text rendered under this object, whatever component carries it.
-        /// TextMeshPro and UI text both expose a `text` property, so reflection
-        /// covers them without referencing either package.
-        private static IEnumerable<string> TextsUnder(GameObject root)
-        {
-            foreach (var child in root.GetComponentsInChildren<Component>(true))
-            {
-                if (child == null)
-                    continue;
-                var property = child.GetType().GetProperty("text");
-                if (property == null || property.PropertyType != typeof(string))
-                    continue;
-                string? value;
-                try
-                {
-                    value = property.GetValue(child, null) as string;
-                }
-                catch
-                {
-                    continue;
-                }
-                if (value != null && value.Length > 0)
-                    yield return child.GetType().Name + "=" + value.Trim();
-            }
-        }
-
-        /// Numeric fields on the component, in case a limit is held as a value
-        /// rather than rendered as text.
-        private static IEnumerable<string> NumericFields(MonoBehaviour behaviour)
-        {
-            foreach (var field in behaviour.GetType().GetFields(
-                System.Reflection.BindingFlags.Public
-                | System.Reflection.BindingFlags.NonPublic
-                | System.Reflection.BindingFlags.Instance))
-            {
-                if (field.FieldType != typeof(int) && field.FieldType != typeof(float))
-                    continue;
-                object? value;
-                try
-                {
-                    value = field.GetValue(behaviour);
-                }
-                catch
-                {
-                    continue;
-                }
-                if (value != null)
-                    yield return field.Name + "=" + value;
-            }
         }
     }
 }

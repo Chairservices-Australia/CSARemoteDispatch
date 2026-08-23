@@ -63,6 +63,13 @@ namespace DvMod.RemoteDispatch
         private static readonly Dictionary<Signals.Game.Signal, int> couplingAspectIndices =
             new Dictionary<Signals.Game.Signal, int>();
 
+        /// Tightest curve on each track. Geometry does not change while the
+        /// world is loaded, and working it out means walking every point of a
+        /// track's kinked point set - which the HUD was doing for every track
+        /// within the lookahead, four times a second.
+        private static readonly Dictionary<RailTrack, float> tightestRadii =
+            new Dictionary<RailTrack, float>();
+
         /// Scratch space for the tracks of the block being examined. This is
         /// read once per signal per refresh, where projecting the block's track
         /// list with LINQ would allocate on every one of them.
@@ -73,6 +80,7 @@ namespace DvMod.RemoteDispatch
             lastHeadings.Clear();
             couplingAspectIndices.Clear();
             blockTrackBuffer.Clear();
+            tightestRadii.Clear();
         }
 
         private static List<RailTrack> BlockTracks(TrackBlock block)
@@ -512,6 +520,17 @@ namespace DvMod.RemoteDispatch
         /// Smallest turning radius on a track, from the heading change between
         /// evenly spaced points: radius = arc length / angle turned.
         private static float TightestRadius(RailTrack track)
+        {
+            if (track == null)
+                return -1f;
+            if (tightestRadii.TryGetValue(track, out var cached))
+                return cached;
+            var measured = MeasureTightestRadius(track);
+            tightestRadii[track] = measured;
+            return measured;
+        }
+
+        private static float MeasureTightestRadius(RailTrack track)
         {
             var pointSet = track == null ? null : track.GetKinkedPointSet();
             var points = pointSet?.points;

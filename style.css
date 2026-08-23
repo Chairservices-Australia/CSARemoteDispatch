@@ -567,3 +567,62 @@ body.theme-dark .followControl a.followControlButton.active svg {
   background: var(--rd-panel-alt);
   border-radius: 3px;
 }
+
+/* The itinerary being built, before it is sent. Numbered because the order is
+   the whole point of it, and kept tight so a full list of eight still sits in
+   the panel above the road list. */
+#routeStopList {
+  margin: 6px 0;
+  padding-left: 22px;
+  font-size: 12px;
+}
+
+#routeStopList.empty {
+  display: none;
+}
+
+#routeStopList li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+}
+
+.routeStopRemove {
+  border: none;
+  background: none;
+  color: var(--rd-text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.routeStopRemove:hover {
+  color: var(--rd-text);
+}
+
+#routeStopHint {
+  font-size: 11px;
+  color: var(--rd-text-muted);
+  margin: 4px 0 6px;
+}
+
+/* How far through a multi-stop road the train is, kept quieter than the place
+   it is running to now. */
+.routeStopProgress {
+  color: var(--rd-text-muted);
+  font-size: 11px;
+}
+
+.junctionMenu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 120px;
+}
+
+.junctionMenuTitle {
+  font-weight: bold;
+  margin-bottom: 2px;
+}
