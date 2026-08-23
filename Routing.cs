@@ -34,6 +34,8 @@ namespace DvMod.RemoteDispatch
         public List<RailTrack> pathTracks = new List<RailTrack>();
         public int progressIndex;   // path entries before this are behind the train
         public int releasedUpTo;    // junctions handed back, never re-taken
+        public int rerouteCount;
+        public float offRouteSince;
     }
 
     /// Route planning and safe junction setting.
@@ -408,7 +410,16 @@ namespace DvMod.RemoteDispatch
                 }
             }
             if (rearmost < 0)
-                return;   // off its road entirely; leave the route as it stands
+            {
+                // Off its road. Give a shunt a moment to step back on before
+                // recomputing, so a brief excursion does not trigger a reroute.
+                if (route.offRouteSince <= 0f)
+                    route.offRouteSince = Time.time;
+                else if (Time.time - route.offRouteSince > OffRouteGraceSeconds)
+                    Reroute(route);
+                return;
+            }
+            route.offRouteSince = 0f;
 
             var moved = rearmost != route.progressIndex;
             route.progressIndex = rearmost;
@@ -437,6 +448,80 @@ namespace DvMod.RemoteDispatch
                 Sessions.AddTag("routes");
         }
 
+        /// How long a train may be off its road before the route is recomputed,
+        /// and how many times that may happen before giving up. The delay keeps
+        /// a shunt that briefly steps off the path from triggering a reroute.
+        public const float OffRouteGraceSeconds = 3f;
+        public const int MaxReroutes = 5;
+
+        public static RailTrack? FindTrack(string trackId)
+        {
+            foreach (var track in Component.FindObjectsOfType<RailTrack>())
+            {
+                var logicTrack = track == null ? null : track.LogicTrack();
+                if (logicTrack == null)
+                    continue;
+                if (logicTrack.ID.FullDisplayID == trackId || logicTrack.ID.FullID == trackId)
+                    return track;
+            }
+            return null;
+        }
+
+        /// Re-assert the road ahead. A junction can be thrown by hand, or by
+        /// another route that outranked this one, after the road was set; without
+        /// this the train would run onto the wrong line with the route still
+        /// reporting itself as set.
+        private static void Revalidate(TrainRoute route)
+        {
+            foreach (var setting in route.settings)
+            {
+                if (setting.junction == null || setting.pathIndex < route.progressIndex)
+                    continue;
+                if (setting.junction.selectedBranch == setting.branch)
+                {
+                    route.pending.Remove(setting.junction);
+                    continue;
+                }
+                if (Occupancy.IsJunctionClear(setting.junction, route.trainsetId))
+                {
+                    setting.junction.Switch(Junction.SwitchMode.REGULAR, setting.branch);
+                    route.pending.Remove(setting.junction);
+                }
+                else
+                {
+                    route.pending.Add(setting.junction);
+                }
+            }
+        }
+
+        /// Recompute a road for a train that has left the one it was given.
+        private static void Reroute(TrainRoute route)
+        {
+            if (route.rerouteCount >= MaxReroutes)
+            {
+                route.status = RouteStatus.Failed;
+                route.message = "Train left its road and could not be rerouted.";
+                return;
+            }
+
+            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var destination = FindTrack(route.destinationTrackId);
+            if (trainset == null || destination == null)
+            {
+                ClearRoute(route.id);
+                return;
+            }
+
+            var destinationId = route.destinationTrackId;
+            var attempts = route.rerouteCount + 1;
+            ClearRoute(route.id);
+
+            var replacement = SetRoute(trainset, destination, destinationId);
+            replacement.rerouteCount = attempts;
+            if (replacement.status != RouteStatus.Failed)
+                replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
+        }
+
         /// Retry deferred junctions. Driven by Updater so it shares the mod's
         /// existing coroutine host rather than starting another one.
         public static IEnumerator RetryPendingCoroutine()
@@ -448,8 +533,14 @@ namespace DvMod.RemoteDispatch
                 foreach (var route in routes.Values.ToList())
                 {
                     UpdateProgress(route);
+                    if (!routes.ContainsKey(route.id))
+                        continue;   // arrived or rerouted during the update
+                    Revalidate(route);
                     if (route.pending.Count == 0)
+                    {
+                        UpdateStatus(route);
                         continue;
+                    }
                     var stillPending = new List<Junction>();
                     foreach (var junction in route.pending)
                     {
