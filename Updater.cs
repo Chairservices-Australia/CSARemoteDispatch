@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -8,8 +9,11 @@ namespace DvMod.RemoteDispatch
 {
     public class Updater : MonoBehaviour
     {
+        private static int mainThreadId;
+
         public void Start()
         {
+            mainThreadId = Thread.CurrentThread.ManagedThreadId;
             StartCoroutine(CheckPlayerTransformCoro());
             StartCoroutine(CheckTrainsetsCoro());
             StartCoroutine(DeferredEventsCoro());
@@ -40,15 +44,17 @@ namespace DvMod.RemoteDispatch
 
         private IEnumerator CheckPlayerTransformCoro()
         {
+            var wait = WaitFor.Seconds(0.1f);
             while (true)
             {
-                yield return WaitFor.Seconds(0.1f);
+                yield return wait;
                 PlayerData.CheckTransform();
             }
         }
 
         private IEnumerator CheckTrainsetsCoro()
         {
+            var wait = WaitFor.Seconds(0.1f);
             while (true)
             {
                 foreach (var trainset in Trainset.allSets)
@@ -58,7 +64,10 @@ namespace DvMod.RemoteDispatch
                         CarUpdater.MarkTrainsetAsDirty(trainset);
                     }
                 }
-                yield return null;
+                // The web UI renders at 10 Hz. Scanning every game frame only
+                // repeats the same work and increases contention with the
+                // multiplayer update loop without producing a visible update.
+                yield return wait;
             }
         }
 
@@ -66,7 +75,10 @@ namespace DvMod.RemoteDispatch
         {
             while (true)
             {
-                while (taskQueue.TryDequeue(out var action))
+                // A burst of HTTP/network work must not monopolize a frame.
+                // Remaining actions stay queued for the next frame.
+                var remaining = 64;
+                while (remaining-- > 0 && taskQueue.TryDequeue(out var action))
                     action();
                 yield return null;
             }
@@ -76,6 +88,11 @@ namespace DvMod.RemoteDispatch
 
         public static Task RunOnMainThread(Action action)
         {
+            if (Thread.CurrentThread.ManagedThreadId == mainThreadId)
+            {
+                action();
+                return Task.CompletedTask;
+            }
             var tcs = new TaskCompletionSource<bool>();
             taskQueue.Enqueue(() =>
             {
@@ -94,6 +111,19 @@ namespace DvMod.RemoteDispatch
 
         public static Task<T> RunOnMainThread<T>(Func<T> func)
         {
+            if (Thread.CurrentThread.ManagedThreadId == mainThreadId)
+            {
+                try
+                {
+                    return Task.FromResult(func());
+                }
+                catch (Exception e)
+                {
+                    var failed = new TaskCompletionSource<T>();
+                    failed.SetException(e);
+                    return failed.Task;
+                }
+            }
             var tcs = new TaskCompletionSource<T>();
             taskQueue.Enqueue(() =>
             {

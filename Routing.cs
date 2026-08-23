@@ -333,11 +333,19 @@ namespace DvMod.RemoteDispatch
             Sessions.AddTag("routes");
         }
 
-        /// Plan and allocate a road, as the host does on behalf of a player.
-        /// The requester is named so everyone can see whose train it is.
-        public static void SetRouteAsAuthority(int trainsetId, string destinationTrackId, string requestedBy)
+        /// Plan and allocate a road on behalf of a session participant. The
+        /// host owns the shared allocation table, but the requesting player
+        /// still owns the action and is identified on the resulting route.
+        public static void SetRouteAsAuthority(
+            int trainsetId, string trainCarGuid, string destinationTrackId, string requestedBy)
         {
-            var trainset = Trainset.allSets?.Find(set => set.id == trainsetId);
+            // Trainset.id is runtime-local and can differ between multiplayer
+            // instances. A car GUID identifies the same consist on the host;
+            // retain the numeric ID only as a compatibility fallback.
+            var car = string.IsNullOrEmpty(trainCarGuid)
+                ? null : TrainCarRegistry.Instance.GetTrainCarByCarGuid(trainCarGuid);
+            var trainset = car?.trainset
+                ?? Trainset.allSets?.Find(set => set.id == trainsetId);
             var destination = FindTrack(destinationTrackId);
             if (trainset == null || destination == null)
             {
@@ -362,13 +370,13 @@ namespace DvMod.RemoteDispatch
                 colorIndex = NextFreeColorIndex(),
             };
 
-            // In a session the world belongs to the host: it holds every other
-            // player's roads, so only there can this one be weighed against
-            // them. The answer arrives as a broadcast of the host's whole list.
-            if (RouteNetwork.RequestRoute(trainset.id, destinationTrackId))
+            // Clients submit their own request, while the host performs the one
+            // shared allocation so independently refreshing pages cannot fight
+            // over a turnout. The host broadcasts the resulting route table.
+            if (RouteNetwork.RequestRoute(trainset, destinationTrackId))
             {
                 route.status = RouteStatus.Pending;
-                route.message = "Requested from the session host...";
+                route.message = "Planning route...";
                 return route;
             }
 
@@ -410,7 +418,7 @@ namespace DvMod.RemoteDispatch
                 if (found == null)
                     continue;
                 var length = PathLength(found);
-                var routeCost = length + CountParallelRightHandChoices(found) * RightHandCostMeters;
+                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters;
                 if (path == null || routeCost < bestRouteCost
                     || (Mathf.Approximately(routeCost, bestRouteCost) && length < shortestLength))
                 {
@@ -799,13 +807,13 @@ namespace DvMod.RemoteDispatch
             route.allocationApplied = false;
         }
 
-        /// A modest distance-equivalent cost for taking the right-hand member of
-        /// a parallel pair. Ordinary branches receive no penalty, so this cannot
-        /// pull a route away from its shortest useful alignment through a yard.
+        /// A modest distance-equivalent cost for a right-hand choice. Physical
+        /// distance remains dominant, but near-equivalent roads consistently
+        /// choose the left line even while a turnout is still diverging.
         private const float RightHandCostMeters = 25f;
 
         private static float LeftHandRunningPenalty(TrackGraph.Step from, TrackGraph.Step to) =>
-            IsParallelRightHandChoice(from, to) ? RightHandCostMeters : 0f;
+            IsRightHandChoice(from, to) ? RightHandCostMeters : 0f;
 
         /// Reports whether a path takes the right-hand option relative to its
         /// actual direction of travel.
@@ -827,56 +835,12 @@ namespace DvMod.RemoteDispatch
             return chosenOffset < leftmostOffset - BranchSideToleranceMeters;
         }
 
-        /// True only when the selected right-hand road and the leftmost option
-        /// are already running in effectively the same direction. A normal
-        /// turnout or station throat is therefore decided solely by distance.
-        private static bool IsParallelRightHandChoice(TrackGraph.Step from, TrackGraph.Step to)
-        {
-            if (!IsRightHandChoice(from, to) || !IsFacingChoice(from, out var junction))
-                return false;
-
-            var position = junction!.position;
-            var approach = ApproachAtJunction(from);
-            var chosenOffset = LateralOffset(position, approach, to.track, to.enteredViaIn);
-            var leftmostOffset = float.MinValue;
-            var leftmostHeading = Vector3.zero;
-
-            foreach (var branch in junction.outBranches)
-            {
-                if (branch == null || branch.track == null)
-                    continue;
-                var offset = LateralOffset(position, approach, branch.track, branch.first);
-                if (offset <= leftmostOffset)
-                    continue;
-                leftmostOffset = offset;
-                leftmostHeading = BranchHeading(branch.track, branch.first);
-            }
-
-            var chosenHeading = BranchHeading(to.track, to.enteredViaIn);
-            if (chosenHeading.sqrMagnitude < 0.0001f || leftmostHeading.sqrMagnitude < 0.0001f)
-                return false;
-
-            const float minimumParallelSeparationMeters = 1.5f;
-            const float cosThreeDegrees = 0.9986295f;
-            return leftmostOffset - chosenOffset >= minimumParallelSeparationMeters
-                && Vector3.Dot(chosenHeading.normalized, leftmostHeading.normalized) >= cosThreeDegrees;
-        }
-
-        private static Vector3 BranchHeading(RailTrack track, bool fromInEnd)
-        {
-            var near = PointAlong(track, fromInEnd, BranchSampleMeters * 0.5f);
-            var far = PointAlong(track, fromInEnd, BranchSampleMeters);
-            var heading = far - near;
-            heading.y = 0f;
-            return heading;
-        }
-
-        private static int CountParallelRightHandChoices(List<TrackGraph.Step> path)
+        private static int CountRightHandChoices(List<TrackGraph.Step> path)
         {
             var count = 0;
             for (var i = 0; i + 1 < path.Count; i++)
             {
-                if (IsParallelRightHandChoice(path[i], path[i + 1]))
+                if (IsRightHandChoice(path[i], path[i + 1]))
                     count++;
             }
             return count;
@@ -980,7 +944,8 @@ namespace DvMod.RemoteDispatch
                 var owner = GetRoute(ownerId);
                 if (owner == null)
                     continue;
-                var ownerSetting = owner.settings.FirstOrDefault(s => s.junction == setting.junction);
+                var ownerSetting = PendingSettings(owner)
+                    .FirstOrDefault(s => s.junction == setting.junction);
                 if (ownerSetting == null || ownerSetting.branch == setting.branch)
                     continue;
                 if (route.priority > owner.priority)
@@ -1340,8 +1305,7 @@ namespace DvMod.RemoteDispatch
             while (true)
             {
                 yield return wait;
-                // A client holds no roads of its own; the host allocates for
-                // everyone and sends the result.
+                // Only the host advances and reallocates the shared route table.
                 if (!RouteNetwork.IsAuthority)
                     continue;
                 foreach (var route in routes.Values.ToList())
@@ -1415,9 +1379,6 @@ namespace DvMod.RemoteDispatch
                         Sessions.AddTag("routes");
                 }
 
-                // Roads move on their own as trains clear crossings, so this is
-                // driven by the list actually changing rather than by any one
-                // place that edits it.
                 PublishRoutes();
             }
         }
@@ -1559,13 +1520,9 @@ namespace DvMod.RemoteDispatch
             new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
             new JProperty("passedTracks", route.progressIndex));
 
-        /// The route list as the page consumes it.
-        ///
-        /// On a client this is the host's list, not the local table: a client
-        /// holds no roads of its own, so anything built from `routes` there
-        /// would be empty. Both the first fetch and the live update stream come
-        /// through here, because serving the host's list to one and the empty
-        /// local table to the other showed the routes and then wiped them.
+        public static string AllRoutesJson() =>
+            AllRoutesToken().ToString(Newtonsoft.Json.Formatting.None);
+
         public static JArray AllRoutesToken()
         {
             if (!RouteNetwork.IsRemoteClient)
@@ -1580,17 +1537,6 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        public static string AllRoutesJson() =>
-            AllRoutesToken().ToString(Newtonsoft.Json.Formatting.None);
-
-        /// Send the route list to the session when it differs from the last one
-        /// sent.
-        ///
-        /// Compared against what actually went out rather than against a
-        /// snapshot taken earlier in the same pass: a road the host set from its
-        /// own page between passes is already present by the time a per-pass
-        /// snapshot is taken, so nothing would look changed and it would never
-        /// be sent.
         public static void PublishRoutes()
         {
             if (!RouteNetwork.Present || !RouteNetwork.IsAuthority)

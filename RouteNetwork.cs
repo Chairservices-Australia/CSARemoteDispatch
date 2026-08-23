@@ -1,4 +1,5 @@
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using MPAPI;
 using MPAPI.Interfaces;
@@ -25,8 +26,10 @@ namespace DvMod.RemoteDispatch
         /// The host's view of every route, as served to a client's own web UI.
         private static string mirroredRoutesJson = "[]";
 
-        private static bool registeredServer;
-        private static bool registeredClient;
+        private static IServer? registeredServer;
+        private static IClient? registeredClient;
+        private static long nextRevision;
+        private static long lastReceivedRevision = -1;
         private static bool? multiplayerPresent;
 
         /// True when the Multiplayer mod is loaded at all.
@@ -74,6 +77,8 @@ namespace DvMod.RemoteDispatch
         public static void Reset()
         {
             mirroredRoutesJson = "[]";
+            nextRevision = 0;
+            lastReceivedRevision = -1;
         }
 
         public static void Initialise()
@@ -88,6 +93,8 @@ namespace DvMod.RemoteDispatch
         {
             MultiplayerAPI.ServerStarted += OnServerStarted;
             MultiplayerAPI.ClientStarted += OnClientStarted;
+            MultiplayerAPI.ServerStopped += OnServerStopped;
+            MultiplayerAPI.ClientStopped += OnClientStopped;
             if (MultiplayerAPI.Server != null)
                 OnServerStarted(MultiplayerAPI.Server);
             if (MultiplayerAPI.Client != null)
@@ -106,26 +113,46 @@ namespace DvMod.RemoteDispatch
         {
             MultiplayerAPI.ServerStarted -= OnServerStarted;
             MultiplayerAPI.ClientStarted -= OnClientStarted;
-            registeredServer = false;
-            registeredClient = false;
+            MultiplayerAPI.ServerStopped -= OnServerStopped;
+            MultiplayerAPI.ClientStopped -= OnClientStopped;
+            OnServerStopped();
+            OnClientStopped();
+        }
+
+        private static void OnServerStopped()
+        {
+            if (registeredServer != null)
+                registeredServer.OnPlayerReady -= OnPlayerReady;
+            registeredServer = null;
+        }
+
+        private static void OnClientStopped()
+        {
+            registeredClient = null;
+            mirroredRoutesJson = "[]";
+            lastReceivedRevision = -1;
         }
 
         private static void OnServerStarted(IServer server)
         {
-            if (registeredServer || server == null)
+            if (server == null || ReferenceEquals(registeredServer, server))
                 return;
-            registeredServer = true;
+            OnServerStopped();
+            registeredServer = server;
             server.RegisterSerializablePacket<RouteRequestPacket>(OnRouteRequested);
             server.RegisterSerializablePacket<RouteClearPacket>(OnClearRequested);
+            server.RegisterSerializablePacket<RouteSyncRequestPacket>(OnSyncRequested);
+            server.OnPlayerReady += OnPlayerReady;
             Main.DebugLog(() => "Route networking: registered host handlers");
         }
 
         private static void OnClientStarted(IClient client)
         {
-            if (registeredClient || client == null)
+            if (client == null || ReferenceEquals(registeredClient, client))
                 return;
-            registeredClient = true;
+            registeredClient = client;
             client.RegisterSerializablePacket<RouteStatePacket>(OnRouteStateReceived);
+            client.SendSerializablePacketToServer(new RouteSyncRequestPacket());
             Main.DebugLog(() => "Route networking: registered client handlers");
         }
 
@@ -136,12 +163,50 @@ namespace DvMod.RemoteDispatch
             // Packets arrive off the network thread; touching junctions, signals
             // or the route table has to happen where the rest of the game runs.
             var trainsetId = packet.trainsetId;
+            var trainCarGuid = packet.trainCarGuid;
+            ResolveHostTrain(packet.trainCarNetId, ref trainsetId, ref trainCarGuid);
             var trackId = packet.destinationTrackId;
+            if ((trainsetId < 0 && string.IsNullOrEmpty(trainCarGuid))
+                || string.IsNullOrWhiteSpace(trackId) || trackId.Length > 256
+                || trainCarGuid.Length > 128)
+                return;
             var who = sender?.DisplayName ?? "a player";
             Updater.RunOnMainThread(() =>
             {
-                Routing.SetRouteAsAuthority(trainsetId, trackId, who);
+                Routing.SetRouteAsAuthority(trainsetId, trainCarGuid, trackId, who);
                 Routing.PublishRoutes();
+            });
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void ResolveHostTrain(uint netId, ref int trainsetId, ref string trainCarGuid)
+        {
+            if (netId == 0 || MultiplayerAPI.Instance == null
+                || !MultiplayerAPI.Instance.TryGetObjectFromNetId<TrainCar>(netId, out var car)
+                || car == null || car.trainset == null)
+                return;
+            trainsetId = car.trainset.id;
+            trainCarGuid = car.CarGUID;
+        }
+
+        private static void OnSyncRequested(RouteSyncRequestPacket packet, IPlayer sender) =>
+            SendSnapshotTo(sender);
+
+        private static void OnPlayerReady(IPlayer player) => SendSnapshotTo(player);
+
+        private static void SendSnapshotTo(IPlayer player)
+        {
+            if (player == null)
+                return;
+            Updater.RunOnMainThread(() =>
+            {
+                var server = registeredServer;
+                if (server != null)
+                    server.SendSerializablePacketToPlayer(new RouteStatePacket
+                    {
+                        revision = nextRevision,
+                        json = Routing.AllRoutesJson(),
+                    }, player);
             });
         }
 
@@ -171,40 +236,52 @@ namespace DvMod.RemoteDispatch
             var server = MultiplayerAPI.Server;
             if (server == null)
                 return;
-            server.SendSerializablePacketToAll(new RouteStatePacket { json = json });
+            server.SendSerializablePacketToAll(new RouteStatePacket
+            {
+                revision = ++nextRevision,
+                json = json,
+            });
         }
 
         // ---------- client side ----------
 
         private static void OnRouteStateReceived(RouteStatePacket packet)
         {
+            if (packet.revision < lastReceivedRevision)
+                return;
+            lastReceivedRevision = packet.revision;
             var json = packet.json ?? "[]";
-            Updater.RunOnMainThread(() =>
-            {
-                mirroredRoutesJson = json;
-                // The page is driven by the tag stream, so it refreshes on its
-                // own once the mirror has been replaced.
-                Sessions.AddTag("routes");
-            });
+            if (json.Length > 1024 * 1024)
+                return;
+            // This mirror and the web session queues are lock-protected/plain
+            // managed data; avoiding a main-thread hop shortens route latency.
+            mirroredRoutesJson = json;
+            Sessions.AddTag("routes");
         }
 
         /// Ask the host to lay a road. Returns false when there is nobody to ask.
-        public static bool RequestRoute(int trainsetId, string destinationTrackId)
+        public static bool RequestRoute(Trainset trainset, string destinationTrackId)
         {
             if (!Present || !IsRemoteClient)
                 return false;
-            return RequestRouteCore(trainsetId, destinationTrackId);
+            return RequestRouteCore(trainset, destinationTrackId);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static bool RequestRouteCore(int trainsetId, string destinationTrackId)
+        private static bool RequestRouteCore(Trainset trainset, string destinationTrackId)
         {
             var client = MultiplayerAPI.Client;
             if (client == null || !client.IsConnected)
                 return false;
+            var anchor = trainset.cars?.FirstOrDefault(car => car != null);
+            uint netId = 0;
+            if (anchor != null && MultiplayerAPI.Instance != null)
+                MultiplayerAPI.Instance.TryGetNetId(anchor, out netId);
             client.SendSerializablePacketToServer(new RouteRequestPacket
             {
-                trainsetId = trainsetId,
+                trainsetId = trainset.id,
+                trainCarNetId = netId,
+                trainCarGuid = anchor?.CarGUID ?? "",
                 destinationTrackId = destinationTrackId,
             });
             return true;
@@ -232,17 +309,23 @@ namespace DvMod.RemoteDispatch
         public class RouteRequestPacket : ISerializablePacket
         {
             public int trainsetId;
+            public uint trainCarNetId;
+            public string trainCarGuid = "";
             public string destinationTrackId = "";
 
             public void Serialize(BinaryWriter writer)
             {
                 writer.Write(trainsetId);
+                writer.Write(trainCarNetId);
+                writer.Write(trainCarGuid ?? "");
                 writer.Write(destinationTrackId ?? "");
             }
 
             public void Deserialize(BinaryReader reader)
             {
                 trainsetId = reader.ReadInt32();
+                trainCarNetId = reader.ReadUInt32();
+                trainCarGuid = reader.ReadString();
                 destinationTrackId = reader.ReadString();
             }
         }
@@ -255,6 +338,12 @@ namespace DvMod.RemoteDispatch
             public void Deserialize(BinaryReader reader) => routeId = reader.ReadString();
         }
 
+        public class RouteSyncRequestPacket : ISerializablePacket
+        {
+            public void Serialize(BinaryWriter writer) { }
+            public void Deserialize(BinaryReader reader) { }
+        }
+
         /// The host's whole route list, as the JSON the page already understands.
         ///
         /// Sent as one document rather than field by field: the shape is decided
@@ -263,10 +352,20 @@ namespace DvMod.RemoteDispatch
         /// the transport fragments it when the list is long.
         public class RouteStatePacket : ISerializablePacket
         {
+            public long revision;
             public string json = "[]";
 
-            public void Serialize(BinaryWriter writer) => writer.Write(json ?? "[]");
-            public void Deserialize(BinaryReader reader) => json = reader.ReadString();
+            public void Serialize(BinaryWriter writer)
+            {
+                writer.Write(revision);
+                writer.Write(json ?? "[]");
+            }
+
+            public void Deserialize(BinaryReader reader)
+            {
+                revision = reader.ReadInt64();
+                json = reader.ReadString();
+            }
         }
     }
 }

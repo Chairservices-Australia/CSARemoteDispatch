@@ -41,16 +41,18 @@ namespace DvMod.RemoteDispatch
         {
             lock (allSesssionsLock)
             {
-                List<string> timedOutSessions = new List<string>();
+                List<string>? timedOutSessions = null;
                 foreach (var kvp in allSessions)
                 {
                     var sessionId = kvp.Key;
                     var session = kvp.Value;
                     if (session.timeSinceLastFetch.Elapsed > SessionTimeout)
-                        timedOutSessions.Add(sessionId);
+                        (timedOutSessions ??= new List<string>()).Add(sessionId);
                     else
                         session.pendingTags.Add(tag);
                 }
+                if (timedOutSessions == null)
+                    return;
                 foreach (var sessionId in timedOutSessions)
                 {
                     Main.DebugLog(() => $"Session {sessionId} timed out");
@@ -125,7 +127,16 @@ namespace DvMod.RemoteDispatch
         public static async Task<string> GetUpdates(string username, string sessionId)
         {
             var tags = await GetTags(username, sessionId).ConfigureAwait(false);
-            return JsonConvert.SerializeObject(tags.ToDictionary(tag => tag, tag => GetUpdateForTag(tag)));
+            // Unity objects are not thread-safe. Build one coherent snapshot on
+            // the game thread instead of mixing values read at different frames
+            // from the HTTP worker thread. Nested data helpers are safe because
+            // RunOnMainThread executes inline when already on that thread.
+            var snapshot = await Updater.RunOnMainThread(() =>
+                tags.ToDictionary(tag => tag, tag => GetUpdateForTag(tag)))
+                .ConfigureAwait(false);
+            // JSON encoding can be sizeable on the initial cars/jobs update and
+            // does not touch Unity. Keep that work on the HTTP worker thread.
+            return JsonConvert.SerializeObject(snapshot);
         }
     }
 }

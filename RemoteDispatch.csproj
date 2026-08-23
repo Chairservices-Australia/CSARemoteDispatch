@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CSARemoteDispatch</AssemblyName>
     <RootNamespace>DvMod.RemoteDispatch</RootNamespace>
-    <InformationalVersion>1.3.0</InformationalVersion>
+    <InformationalVersion>1.3.1</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,9 +29,8 @@
     <Reference Include="Newtonsoft.Json"/>
     <Reference Include="net.smkd.vector3d"/>
     <Reference Include="WorldStreamer" />
-    <!-- Optional at runtime: the mod checks Unity Mod Manager for Multiplayer
-         before touching any type from this assembly, so a session-less install
-         never loads it. Still needed to build. -->
+    <!-- Optional at runtime: RouteNetwork checks Unity Mod Manager before any
+         Multiplayer API type is resolved. -->
     <Reference Include="MultiplayerAPI">
       <HintPath>$(DvInstallDir)\Mods\Multiplayer\MultiplayerAPI.dll</HintPath>
       <Private>false</Private>
