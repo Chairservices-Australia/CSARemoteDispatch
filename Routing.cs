@@ -37,7 +37,7 @@ namespace DvMod.RemoteDispatch
         public int releasedUpTo;    // junctions handed back, never re-taken
         public int rerouteCount;
         public float offRouteSince;
-        public bool directionVerified;
+        public float wrongWaySince;
         public string notice = "";   // survives status updates
     }
 
@@ -156,6 +156,35 @@ namespace DvMod.RemoteDispatch
         /// Far enough that parallel roads have visibly separated, short enough
         /// that a curve further along does not reverse the answer.
         private const float BranchSampleMeters = 40f;
+
+        /// The position of one end of a track.
+        private static Vector3 CurveEnd(RailTrack track, bool atInEnd)
+        {
+            var curve = track == null ? null : track.curve;
+            if (curve == null || curve.pointCount == 0)
+                return track == null ? Vector3.zero : track.transform.position;
+            var p = curve[atInEnd ? 0 : curve.pointCount - 1].position;
+            return new Vector3(p.x, 0f, p.z);
+        }
+
+        /// Direction a train is travelling as it arrives at the junction, taken
+        /// over the same distance the branches are sampled over.
+        ///
+        /// Measuring this from the chord between the track's bezier anchors was
+        /// what broke left and right: on curving track those anchors sit a
+        /// hundred metres or more apart, so the chord is nowhere near the tangent
+        /// at the junction. A few degrees of error there is enough to push both
+        /// branches onto the same side, which is exactly what was observed - two
+        /// legs of one turnout both reading left, or both right.
+        private static Vector3 ApproachAtJunction(TrackGraph.Step from)
+        {
+            var endIsIn = !from.enteredViaIn;
+            var endPoint = CurveEnd(from.track, endIsIn);
+            var backPoint = PointAlong(from.track, endIsIn, BranchSampleMeters);
+            var direction = endPoint - backPoint;
+            direction.y = 0;
+            return direction;
+        }
 
         /// Derive the junction settings a path requires.
         public static List<JunctionSetting> SettingsForPath(List<TrackGraph.Step> path)
@@ -349,7 +378,7 @@ namespace DvMod.RemoteDispatch
                 return 0f;
 
             var junctionPosition = junction!.position;
-            var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
+            var approach = ApproachAtJunction(from);
             if (IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn))
                 return 0f;
 
@@ -390,7 +419,7 @@ namespace DvMod.RemoteDispatch
                     continue;
 
                 var junctionPosition = junction!.position;
-                var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
+                var approach = ApproachAtJunction(from);
                 var tookLeft = IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn);
                 if (tookLeft)
                     route.leftDivergences++;
@@ -624,9 +653,6 @@ namespace DvMod.RemoteDispatch
 
             var replacement = SetRoute(trainset, destination, destinationId);
             replacement.rerouteCount = attempts;
-            // The re-laid road was computed from real motion, so its direction is
-            // already confirmed and must not trigger another verification pass.
-            replacement.directionVerified = true;
             if (replacement.status != RouteStatus.Failed)
                 replacement.message = "Rerouted (" + attempts + "). " + replacement.message;
         }
@@ -665,32 +691,30 @@ namespace DvMod.RemoteDispatch
         /// set to the left for that direction.
         private static void VerifyDirection(TrainRoute route)
         {
-            if (route.directionVerified || route.pathTracks.Count < 2)
+            if (route.pathTracks.Count < 2)
                 return;
 
             var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
-            var lead = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(c => c != null);
-            if (lead == null || lead.rb == null)
+            if (trainset == null)
                 return;
 
-            var velocity = lead.rb.velocity;
+            // Motion is the best evidence of where a train is going; before it
+            // moves, the reverser states the same intent.
+            var lead = trainset.firstCar ?? trainset.cars?.FirstOrDefault(c => c != null);
+            var velocity = lead?.rb != null ? lead.rb.velocity : Vector3.zero;
             velocity.y = 0;
 
-            // Real motion is the best evidence; failing that the reverser is a
-            // statement of intent, and is available before the train moves.
             Vector3 heading;
             if (velocity.sqrMagnitude >= 0.25f)
-            {
                 heading = velocity.normalized;
-            }
             else
             {
                 heading = Signalling.ReverserHeading(trainset);
                 if (heading.sqrMagnitude < 0.001f)
-                    return;   // nothing to judge by yet
+                    return;   // standing with the reverser centred: nothing to check
             }
 
-            // Where the road goes from the train's current position.
+            // Where the booked road goes from where the train currently is.
             var index = Mathf.Clamp(route.progressIndex, 0, route.pathTracks.Count - 2);
             var here = route.pathTracks[index];
             var next = route.pathTracks[index + 1];
@@ -702,13 +726,33 @@ namespace DvMod.RemoteDispatch
             if (alongRoute.sqrMagnitude < 0.01f)
                 return;
 
-            route.directionVerified = true;
             if (Vector3.Dot(alongRoute.normalized, heading) >= 0f)
-                return;   // heading the way the road was laid
+            {
+                route.wrongWaySince = 0f;
+                return;
+            }
 
-            Main.DebugLog(() => $"Route {route.id}: train set off opposite the booked road; re-laying.");
+            // Opposed. Checked every tick rather than once, so a train that
+            // changes direction mid-journey has its road re-laid for the new one,
+            // which is also what re-sets the junctions ahead to the left for it.
+            // A short delay avoids re-laying on the momentary reversal of a
+            // shunt or a rollback.
+            if (route.wrongWaySince <= 0f)
+            {
+                route.wrongWaySince = Time.time;
+                return;
+            }
+            if (Time.time - route.wrongWaySince < WrongWayGraceSeconds)
+                return;
+
+            route.wrongWaySince = 0f;
+            Main.DebugLog(() => $"Route {route.id}: travelling opposite the booked road; re-laying.");
             Reroute(route);
         }
+
+        /// How long a train must be heading against its road before it is
+        /// re-laid, so a shunt or a rollback does not trigger one.
+        public const float WrongWayGraceSeconds = 2f;
 
         private static Vector3 CentreOf(RailTrack track)
         {

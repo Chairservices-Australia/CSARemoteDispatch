@@ -97,9 +97,12 @@ namespace DvMod.RemoteDispatch
 
         /// The limit in force at a position for a train travelling `heading`.
         ///
-        /// The governing sign is the nearest one already passed whose face the
-        /// train drove towards; a sign facing the other way governs traffic in
-        /// the opposite direction and says nothing about this train.
+        /// Signs divide the line into zones: a limit applies from the sign that
+        /// posts it until the next one, so the governing sign is the nearest one
+        /// already passed. Signs facing the other way belong to the opposite
+        /// direction, and signs set well off to the side belong to a parallel
+        /// line, so both are skipped - but if that leaves nothing, the nearest
+        /// passed sign is used anyway rather than reporting no limit at all.
         public static int? LimitAt(Vector3 position, Vector3 heading)
         {
             var flatHeading = new Vector3(heading.x, 0, heading.z);
@@ -107,8 +110,10 @@ namespace DvMod.RemoteDispatch
                 return null;
             flatHeading = flatHeading.normalized;
 
-            var bestDistance = float.MaxValue;
-            int? best = null;
+            var bestFacing = float.MaxValue;
+            int? facingLimit = null;
+            var bestAny = float.MaxValue;
+            int? anyLimit = null;
 
             foreach (var sign in known.Values)
             {
@@ -116,26 +121,37 @@ namespace DvMod.RemoteDispatch
                 toTrain.y = 0;
                 var behind = Vector3.Dot(toTrain, flatHeading);
                 if (behind < 0f || behind > MaxDistanceBehind)
-                    continue;   // not yet reached, or too far back to still apply
+                    continue;   // not reached yet, or too far back to still apply
 
-                // The train must have approached the printed face of the sign.
+                var lateral = (toTrain - flatHeading * behind).magnitude;
+                if (lateral > MaxLateralMeters)
+                    continue;   // belongs to a line running alongside this one
+
+                if (behind < bestAny)
+                {
+                    bestAny = behind;
+                    anyLimit = sign.kph;
+                }
+
+                // A sign posted for this direction faces the traffic reading it,
+                // so its forward points back along the way the train is going.
                 var facing = new Vector3(sign.facing.x, 0, sign.facing.z);
                 if (facing.sqrMagnitude > 0.0001f
                     && Vector3.Dot(facing.normalized, flatHeading) > 0.3f)
-                    continue;   // sign faces the way we are going: it is for the other road
-
-                // Sideways offset keeps signs on a parallel line from being read.
-                var lateral = (toTrain - flatHeading * behind).magnitude;
-                if (lateral > 25f)
                     continue;
 
-                if (behind < bestDistance)
+                if (behind < bestFacing)
                 {
-                    bestDistance = behind;
-                    best = sign.kph;
+                    bestFacing = behind;
+                    facingLimit = sign.kph;
                 }
             }
-            return best;
+
+            return facingLimit ?? anyLimit;
         }
+
+        /// How far to the side a sign may sit and still be read as governing
+        /// this line.
+        public const float MaxLateralMeters = 40f;
     }
 }
