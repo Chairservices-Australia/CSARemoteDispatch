@@ -1,7 +1,10 @@
 using System.Collections.Generic;
 using System.Linq;
+using HarmonyLib;
+using Signals.Common;
 using Signals.Game;
 using Signals.Game.Controllers;
+using Signals.Game.Generation;
 using Signals.Game.Railway;
 using UnityEngine;
 
@@ -113,19 +116,83 @@ namespace DvMod.RemoteDispatch
 
             signalName = controller.Name;
             distance = Vector3.Distance(position, controller.Position);
-            if (current.DisallowPassing)
-            {
-                aspect = Aspect.Stop;
-                return;
-            }
+            aspect = NswAspect(current);
+        }
 
-            // DV Signals orders a signal's aspects from most to least
-            // restrictive. Preserve its decision; this is only a reduction to
-            // the three-lamp CSA HUD, not a second occupancy calculation.
-            var remaining = signal.AllAspects.Length - 1 - signal.CurrentAspectIndex;
-            aspect = remaining <= 0 ? Aspect.Clear
-                : remaining == 1 ? Aspect.Caution
-                : Aspect.PreliminaryCaution;
+        /// Translate what DV Signals is physically displaying, rather than the
+        /// aspect's array index. Different controller types contain different
+        /// numbers of route, reservation and shunting aspects, so index-based
+        /// mapping incorrectly made most of them preliminary caution.
+        private static Aspect NswAspect(Signals.Game.Aspects.IAspect current)
+        {
+            if (current.DisallowPassing)
+                return Aspect.Stop;
+
+            var definition = current.GetDefinition();
+            var steady = definition.OnLights ?? new SignalLightDefinition[0];
+            var blinking = definition.BlinkingLights ?? new SignalLightDefinition[0];
+
+            if (blinking.Any(light => IsAmber(light.Colour)))
+                return Aspect.PreliminaryCaution;
+            if (steady.Any(light => IsAmber(light.Colour)))
+                return Aspect.Caution;
+            if (steady.Any(light => IsGreen(light.Colour)))
+                return Aspect.Clear;
+
+            // Semaphore/custom packs may not encode their indication as a
+            // coloured lamp. Their definition names retain the same semantics.
+            var name = definition.gameObject == null ? "" : definition.gameObject.name;
+            if (Contains(name, "clear"))
+                return Aspect.Clear;
+            if (Contains(name, "nextstop") || Contains(name, "expectstop")
+                || Contains(name, "restricted"))
+                return Aspect.Caution;
+            return Aspect.Caution;
+        }
+
+        private static bool IsAmber(Color colour) =>
+            colour.r > 0.45f && colour.g > 0.25f && colour.b < 0.35f;
+
+        private static bool IsGreen(Color colour) =>
+            colour.g > 0.35f && colour.g > colour.r * 1.2f && colour.g > colour.b * 1.2f;
+
+        private static bool Contains(string value, string text) =>
+            value.IndexOf(text, System.StringComparison.OrdinalIgnoreCase) >= 0;
+
+        /// DV Signals' default pack includes a three-lamp main controller plus
+        /// optional four-lamp variants for entries, exits and combined signals.
+        /// NSW mode consistently uses the three-lamp controller for all main
+        /// signals while retaining dedicated distant and shunting equipment.
+        [HarmonyPatch(typeof(RealisticSignalPlacer), nameof(RealisticSignalPlacer.CreateSignals))]
+        private static class NswSignalPackPatch
+        {
+            private static void Prefix(SignalPack pack)
+            {
+                if (pack == null || pack.Signal == null)
+                    return;
+                var main = pack.Signal;
+                pack.DivergingSignal = main;
+                pack.LeftJunctionSignal = main;
+                pack.RightJunctionSignal = main;
+                pack.EntrySignal = main;
+                pack.ExitSignal = main;
+                pack.ExitPassengerSignal = main;
+                pack.ExitMainlineSignal = main;
+                pack.CombinedSignal = main;
+                pack.CombinedLeftJunctionSignal = main;
+                pack.CombinedRightJunctionSignal = main;
+                pack.OldSignal = main;
+                pack.OldDivergingSignal = main;
+                pack.OldLeftJunctionSignal = main;
+                pack.OldRightJunctionSignal = main;
+                pack.OldEntrySignal = main;
+                pack.OldExitSignal = main;
+                pack.OldExitPassengerSignal = main;
+                pack.OldExitMainlineSignal = main;
+                pack.OldCombinedSignal = main;
+                pack.OldCombinedLeftJunctionSignal = main;
+                pack.OldCombinedRightJunctionSignal = main;
+            }
         }
 
         /// Direction the driver has selected, from the reverser, or zero when it
