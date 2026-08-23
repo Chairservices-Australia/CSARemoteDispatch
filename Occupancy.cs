@@ -184,11 +184,19 @@ namespace DvMod.RemoteDispatch
         /// powered-train occupancy. Routing avoids all occupied through tracks,
         /// while an unpowered destination remains usable for a coupling move.
         public static void OccupiedTracksByOthers(
-            int ownTrainsetId, HashSet<RailTrack> occupied, HashSet<RailTrack> powered)
+            int ownTrainsetId, HashSet<RailTrack> occupied, HashSet<RailTrack> powered,
+            bool requireFresh = false)
         {
             occupied.Clear();
             powered.Clear();
-            EnsureIndex(DisplayMaxAgeSeconds);
+            // Route creation follows coupling/uncoupling closely enough that a
+            // quarter-second display cache can still describe the old consist.
+            // A route request pays for one exact rebuild; continuous lookahead
+            // continues to share the cheaper cached index.
+            if (requireFresh)
+                Rebuild();
+            else
+                EnsureIndex(DisplayMaxAgeSeconds);
             foreach (var pair in carsByTrack)
             {
                 foreach (var car in pair.Value)

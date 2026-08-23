@@ -409,7 +409,24 @@ namespace DvMod.RemoteDispatch
             var occupiedByOthers = new HashSet<RailTrack>();
             var poweredByOthers = new HashSet<RailTrack>();
             Occupancy.OccupiedTracksByOthers(
-                trainset.id, occupiedByOthers, poweredByOthers);
+                trainset.id, occupiedByOthers, poweredByOthers, requireFresh: true);
+            var reversalStartClear = !occupied.Overlaps(occupiedByOthers);
+            if (!reversalStartClear)
+            {
+                // With detached cars sharing the current track, only the first
+                // candidate aligned with the driver's reverser intent is safe.
+                // Considering the opposite end would itself be an unmodelled
+                // reverse move through those cars, even without PlanReversal.
+                var intent = Signalling.ReverserHeading(trainset);
+                if (intent.sqrMagnitude < 0.001f)
+                {
+                    route.status = RouteStatus.Failed;
+                    route.message = "Detached cars share the train's track. Set the reverser toward the clear end before routing.";
+                    routes[route.id] = route;
+                    return route;
+                }
+                candidates = new List<TrackGraph.Step> { candidates[0] };
+            }
             bool IsBlocked(TrackGraph.Step step) =>
                 occupiedByOthers.Contains(step.track)
                 && (!goals.Contains(step.track) || poweredByOthers.Contains(step.track));
@@ -444,7 +461,12 @@ namespace DvMod.RemoteDispatch
             // Where no single-direction road exists - or where one exists but
             // is far enough round to be worse than stopping and changing ends -
             // look for a road that runs out and sets back.
-            var reversal = allowReversal
+            // Reversing is unsafe when a newly detached cut shares any track
+            // component under the train. The graph carries track and direction,
+            // not positions along one track, so allowing the start state would
+            // otherwise make cars behind the consist invisible to the reverse
+            // leg and favour an impossible "shortest" route.
+            var reversal = allowReversal && reversalStartClear
                 ? PlanReversal(candidates, goals, ConsistLength(trainset), IsBlocked)
                 : null;
             var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
