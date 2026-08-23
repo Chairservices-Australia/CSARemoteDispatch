@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -75,10 +76,10 @@ namespace DvMod.RemoteDispatch
         {
             if (trackGrid.Count == 0 || Time.time >= nextTrackGridTime)
             {
-                BuildTrackGrid(Object.FindObjectsOfType<RailTrack>());
+                BuildTrackGrid(UnityEngine.Object.FindObjectsOfType<RailTrack>());
                 nextTrackGridTime = Time.time + TrackGridRefreshSeconds;
             }
-            foreach (var data in Object.FindObjectsOfType<SignGeneratorData>())
+            foreach (var data in UnityEngine.Object.FindObjectsOfType<SignGeneratorData>())
             {
                 if (data == null || data.signParameters == null)
                     continue;
@@ -135,23 +136,24 @@ namespace DvMod.RemoteDispatch
         /// neighbouring station roads cannot change the limit. Once selected,
         /// the value persists across track boundaries until another sign is
         /// actually passed.
-        public static int LimitAt(int trainsetId, TrainCar? leadCar, Vector3 heading, int initialLimit)
+        public static int LimitAt(int trainsetId, TrainCar? leadCar, Vector3 heading,
+            Func<int> initialLimit)
         {
             trainStates.TryGetValue(trainsetId, out var state);
             if (leadCar == null)
-                return state?.limit ?? initialLimit;
+                return state?.limit ?? initialLimit();
             var bogie = leadCar.Bogies?.FirstOrDefault(b => b != null && b.track != null);
             if (bogie == null)
-                return state?.limit ?? initialLimit;
+                return state?.limit ?? initialLimit();
 
             var position = leadCar.transform.position;
             var flatHeading = new Vector3(heading.x, 0, heading.z);
             if (flatHeading.sqrMagnitude < 0.0001f || known.Count == 0)
-                return state?.limit ?? initialLimit;
+                return state?.limit ?? initialLimit();
             flatHeading = flatHeading.normalized;
 
             if (!ProjectOntoTrack(position, bogie.track, out var trainPosition, out _))
-                return state?.limit ?? initialLimit;
+                return state?.limit ?? initialLimit();
 
             if (state == null)
             {
@@ -160,7 +162,7 @@ namespace DvMod.RemoteDispatch
                     leadCar = leadCar,
                     track = bogie.track,
                     trackPosition = trainPosition,
-                    limit = InitialLimit(bogie.track, trainPosition, flatHeading) ?? initialLimit,
+                    limit = InitialLimit(bogie.track, trainPosition, flatHeading) ?? initialLimit(),
                 };
                 if (trainsetId >= 0)
                     trainStates[trainsetId] = state;
@@ -342,6 +344,10 @@ namespace DvMod.RemoteDispatch
             }
             return distance < float.MaxValue;
         }
+
+        internal static bool TryProjectOntoTrack(Vector3 position, RailTrack track,
+            out float along, out float distance) =>
+            ProjectOntoTrack(position, track, out along, out distance);
 
         private static bool TrackDirectionAt(RailTrack track, float along, Vector3 heading)
             => Vector3.Dot(TangentAt(track, along), heading) >= 0f;

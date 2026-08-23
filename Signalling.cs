@@ -93,7 +93,7 @@ namespace DvMod.RemoteDispatch
             // latches either value until the leading end crosses another sign.
             SpeedSigns.ScanIfDue();
             var speed = SpeedSigns.LimitAt(
-                ownTrainsetId, leadCar, heading, SpeedLimitFor(start.Value));
+                ownTrainsetId, leadCar, heading, () => SpeedLimitFor(start.Value));
             return new Reading(aspect, speed, blockAhead, approachingDistance);
         }
 
@@ -106,9 +106,7 @@ namespace DvMod.RemoteDispatch
             if (!SignalManager.Running)
                 return;
 
-            var direction = start.enteredViaIn ? TrackDirection.Out : TrackDirection.In;
-            TrackWalker.GetTracksUntilMainSignal(start.track, direction, out var info);
-            var controller = info.Signal;
+            var controller = NextDvSignalController(start, position);
             var signal = controller?.GetControllerSignal();
             var current = signal?.CurrentAspect;
             if (controller == null || signal == null || current == null)
@@ -117,6 +115,42 @@ namespace DvMod.RemoteDispatch
             signalName = controller.Name;
             distance = Vector3.Distance(position, controller.Position);
             aspect = NswAspect(current);
+        }
+
+        internal static BasicSignalController? NextDvSignalController(
+            TrackGraph.Step start, Vector3 position)
+        {
+            if (!SignalManager.Running)
+                return null;
+            var direction = start.enteredViaIn ? TrackDirection.Out : TrackDirection.In;
+            TrackWalker.GetTracksUntilMainSignal(start.track, direction, out var info);
+            var controller = info.Signal;
+            if (controller != null && HasPassed(controller, start.track, direction, position))
+            {
+                // TrackWalker starts at a whole RailTrack and can therefore
+                // return a signal at the end already passed by the leading cab.
+                TrackWalker.GetTracksUntilMainSignal(
+                    start.track, direction, controller, out info);
+                controller = info.Signal;
+            }
+            return controller;
+        }
+
+        private static bool HasPassed(BasicSignalController controller, RailTrack currentTrack,
+            TrackDirection direction, Vector3 trainPosition)
+        {
+            var placement = controller.PlacementInfo;
+            if (!placement.HasValue || placement.Value.Track != currentTrack)
+                return false;
+            if (!SpeedSigns.TryProjectOntoTrack(trainPosition, currentTrack,
+                    out var trainAlong, out _)
+                || !SpeedSigns.TryProjectOntoTrack(controller.Position, currentTrack,
+                    out var signalAlong, out _))
+                return false;
+            const float passedToleranceMeters = 0.75f;
+            return direction == TrackDirection.Out
+                ? trainAlong > signalAlong + passedToleranceMeters
+                : trainAlong < signalAlong - passedToleranceMeters;
         }
 
         /// Translate what DV Signals is physically displaying, rather than the
@@ -267,7 +301,7 @@ namespace DvMod.RemoteDispatch
         }
 
         /// The car at the leading end of the consist for this direction.
-        private static TrainCar LeadingCar(Trainset? trainset, TrainCar fallback, Vector3 heading)
+        internal static TrainCar LeadingCar(Trainset? trainset, TrainCar fallback, Vector3 heading)
         {
             var first = trainset?.firstCar;
             var last = trainset?.lastCar;

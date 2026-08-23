@@ -2,6 +2,8 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using Newtonsoft.Json.Linq;
+using Signals.Game;
+using Signals.Game.Railway;
 using UnityEngine;
 
 namespace DvMod.RemoteDispatch
@@ -34,6 +36,10 @@ namespace DvMod.RemoteDispatch
         public float distanceMeters;
         public JArray divergenceDetail = new JArray();
         public List<RailTrack> pathTracks = new List<RailTrack>();
+        public List<TrackGraph.Step> pathSteps = new List<TrackGraph.Step>();
+        public Signals.Game.Signal? reservedSignal;
+        public bool allocationApplied;
+        public bool waitingForSignal;
         public int progressIndex;   // path entries before this are behind the train
         public int releasedUpTo;    // junctions handed back, never re-taken
         public int rerouteCount;
@@ -233,6 +239,13 @@ namespace DvMod.RemoteDispatch
                 var tracks = station == null ? null : station.AllStationTracks;
                 if (tracks != null && tracks.Contains(startTrack))
                     return 1;
+                var logic = startTrack.LogicTrack();
+                var display = logic == null ? "" : logic.ID.FullDisplayID;
+                var separator = display.IndexOf('-');
+                var yard = separator > 0 ? display.Substring(0, separator) : "";
+                if (station != null && station.StationInfoValid
+                    && yard == station.stationInfo.YardID)
+                    return 1;
             }
             return 0;
         }
@@ -246,8 +259,7 @@ namespace DvMod.RemoteDispatch
         {
             if (!routes.TryGetValue(id, out var route))
                 return;
-            foreach (var junction in reservations.Where(kvp => kvp.Value == id).Select(kvp => kvp.Key).ToList())
-                reservations.Remove(junction);
+            ReleaseAllocation(route);
             route.status = RouteStatus.Cleared;
             routes.Remove(id);
             Sessions.AddTag("routes");
@@ -255,6 +267,8 @@ namespace DvMod.RemoteDispatch
 
         public static void ClearAll()
         {
+            foreach (var route in routes.Values.ToList())
+                ReleaseAllocation(route);
             routes.Clear();
             reservations.Clear();
             Sessions.AddTag("routes");
@@ -339,6 +353,7 @@ namespace DvMod.RemoteDispatch
             route.requiresReverse = !occupied.Contains(chosen.track) || IsPropelling(trainset, chosen);
 
             route.pathTracks = path.Select(step => step.track).ToList();
+            route.pathSteps = path;
             // FullDisplayID, matching both the /track keys the map draws with and
             // the IDs the game prints on jobs.
             route.trackIds = path
@@ -349,22 +364,135 @@ namespace DvMod.RemoteDispatch
             route.settings = SettingsForPath(path);
             CountDivergences(path, route);
 
+            routes[route.id] = route;
+            TryActivate(route);
+            Sessions.AddTag("routes");
+            return route;
+        }
+
+        private static bool TryActivate(TrainRoute route)
+        {
+            if (MultiplayerIntegration.IsMpRunning && !MultiplayerIntegration.IsHost)
+            {
+                route.status = RouteStatus.Failed;
+                route.message = "Route allocation must be performed by the multiplayer host.";
+                return false;
+            }
+
             var conflict = FirstConflict(route);
             if (conflict != null)
             {
-                route.status = RouteStatus.Conflict;
-                route.message = conflict;
-                routes[route.id] = route;
-                return route;
+                route.status = RouteStatus.Pending;
+                route.message = "Waiting to allocate route: " + conflict;
+                route.allocationApplied = false;
+                return false;
+            }
+            route.waitingForSignal = false;
+            foreach (var setting in PendingSettings(route))
+                reservations[setting.junction] = route.id;
+            route.allocationApplied = true;
+            Apply(route);
+            if (route.pending.Count == 0 && !TryReserveNextSignal(route))
+            {
+                ReleaseAllocation(route);
+                route.waitingForSignal = true;
+                route.status = RouteStatus.Pending;
+                route.message = "Waiting for the protecting signal route to clear.";
+                return false;
+            }
+            return true;
+        }
+
+        private static bool TryReserveNextSignal(TrainRoute route)
+        {
+            if (!SignalManager.Running || route.pathSteps.Count == 0)
+                return true;
+            var trainset = Trainset.allSets?.Find(set => set.id == route.trainsetId);
+            var fallback = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(car => car != null);
+            if (fallback == null)
+                return false;
+            var index = Mathf.Clamp(route.progressIndex, 0, route.pathSteps.Count - 1);
+            var step = route.pathSteps[index];
+            var curve = step.track.curve;
+            var heading = curve == null || curve.pointCount < 2
+                ? fallback.transform.forward
+                : curve[curve.pointCount - 1].position - curve[0].position;
+            if (!step.enteredViaIn)
+                heading = -heading;
+            var lead = Signalling.LeadingCar(trainset, fallback, heading);
+            var controller = Signalling.NextDvSignalController(
+                step, lead.transform.position);
+            var signal = controller?.GetControllerSignal();
+            if (signal == null || signal == route.reservedSignal)
+                return true;
+
+            if (route.reservedSignal != null && TrackReserver.HasReservation(route.reservedSignal))
+                ReleaseSignal(route.reservedSignal);
+
+            if (ReserveSignal(signal))
+            {
+                route.reservedSignal = signal;
+                route.waitingForSignal = false;
+                return true;
             }
 
-            foreach (var setting in route.settings)
-                reservations[setting.junction] = route.id;
+            // Departures have priority over inbound trains. If the conflicting
+            // DV Signals reservation belongs to one of our lower-priority
+            // routes, release it and leave that inbound route pending for the
+            // retry coroutine to allocate again.
+            var block = signal.Block;
+            if (block != null)
+            {
+                foreach (var track in block.AllTracks)
+                {
+                    if (!TrackReserver.IsTrackReserved(track, out var by))
+                        continue;
+                    var owner = routes.Values.FirstOrDefault(candidate =>
+                        candidate != route && candidate.reservedSignal == by);
+                    if (owner == null || route.priority <= owner.priority)
+                        continue;
+                    ReleaseAllocation(owner);
+                    owner.waitingForSignal = true;
+                    owner.status = RouteStatus.Pending;
+                    owner.message = "Held for higher-priority departure " + route.id + ".";
+                    if (ReserveSignal(signal))
+                    {
+                        route.reservedSignal = signal;
+                        route.waitingForSignal = false;
+                        return true;
+                    }
+                }
+            }
+            route.waitingForSignal = true;
+            return false;
+        }
 
-            routes[route.id] = route;
-            Apply(route);
-            Sessions.AddTag("routes");
-            return route;
+        private static bool ReserveSignal(Signals.Game.Signal signal)
+        {
+            if (!TrackReserver.ReserveForSignal(signal))
+                return false;
+            if (MultiplayerIntegration.IsMpRunning && MultiplayerIntegration.IsHost)
+                MultiplayerIntegration.SendReservationRequest(signal, -1f);
+            return true;
+        }
+
+        private static void ReleaseSignal(Signals.Game.Signal signal)
+        {
+            TrackReserver.ClearFromSignal(signal);
+            if (MultiplayerIntegration.IsMpRunning && MultiplayerIntegration.IsHost)
+                MultiplayerIntegration.SendReservationCancelRequest(signal);
+        }
+
+        private static void ReleaseAllocation(TrainRoute route)
+        {
+            foreach (var junction in reservations.Where(pair => pair.Value == route.id)
+                .Select(pair => pair.Key).ToList())
+                reservations.Remove(junction);
+            if (route.reservedSignal != null && TrackReserver.HasReservation(route.reservedSignal)
+                && (!MultiplayerIntegration.IsMpRunning || MultiplayerIntegration.IsHost))
+                ReleaseSignal(route.reservedSignal);
+            route.reservedSignal = null;
+            route.allocationApplied = false;
         }
 
         /// Reports whether a path takes the right-hand option. This no longer
@@ -480,9 +608,13 @@ namespace DvMod.RemoteDispatch
                     continue;
                 if (route.priority > owner.priority)
                 {
-                    // A departure outranks the holder, so take the junction from it.
-                    owner.status = RouteStatus.Conflict;
-                    owner.message = "Junction released to higher-priority route " + route.id + ".";
+                    // A departure outranks the inbound holder. Release the
+                    // entire allocation so its signal and junctions agree, then
+                    // let the retry coroutine allocate it again later.
+                    ReleaseAllocation(owner);
+                    owner.waitingForSignal = true;
+                    owner.status = RouteStatus.Pending;
+                    owner.message = "Held for higher-priority departure " + route.id + ".";
                     continue;
                 }
                 return "Junction reserved by route " + ownerId + " for train " + owner.trainsetId + ".";
@@ -512,12 +644,15 @@ namespace DvMod.RemoteDispatch
             // this used to overwrite it and hide notices entirely.
             var notice = route.notice;
 
-            route.status = route.pending.Count > 0 ? RouteStatus.Pending : RouteStatus.Active;
+            route.status = route.pending.Count > 0 || route.waitingForSignal
+                ? RouteStatus.Pending : RouteStatus.Active;
             var divergences = route.leftDivergences + route.rightDivergences > 0
                 ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
                 : "";
             var prefix = notice + (route.requiresReverse ? "Route set, train propels (cars lead). " : "");
-            route.message = route.pending.Count > 0
+            route.message = route.waitingForSignal
+                ? prefix + "Waiting for the protecting signal route to clear."
+                : route.pending.Count > 0
                 ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
                 : notice + (route.requiresReverse
                     ? "Route set" + divergences + " - train propels, cars lead."
@@ -789,6 +924,15 @@ namespace DvMod.RemoteDispatch
                 yield return wait;
                 foreach (var route in routes.Values.ToList())
                 {
+                    if (route.status == RouteStatus.Failed || route.status == RouteStatus.Cleared)
+                        continue;
+                    if (!route.allocationApplied)
+                    {
+                        TryActivate(route);
+                        if (!route.allocationApplied)
+                            continue;
+                        Sessions.AddTag("routes");
+                    }
                     VerifyDirection(route);
                     if (!routes.ContainsKey(route.id))
                         continue;   // re-laid during verification
@@ -798,6 +942,14 @@ namespace DvMod.RemoteDispatch
                     Revalidate(route);
                     if (route.pending.Count == 0)
                     {
+                        if (!TryReserveNextSignal(route))
+                        {
+                            ReleaseAllocation(route);
+                            route.waitingForSignal = true;
+                            UpdateStatus(route);
+                            Sessions.AddTag("routes");
+                            continue;
+                        }
                         UpdateStatus(route);
                         continue;
                     }
