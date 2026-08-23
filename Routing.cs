@@ -24,7 +24,7 @@ namespace DvMod.RemoteDispatch
         public string id = "";
         public int trainsetId;
         public string destinationTrackId = "";
-        public int priority;                       // higher wins a contested junction
+        public int priority;                       // tie-breaker for equally close approaches
         public RouteStatus status = RouteStatus.Active;
         public string message = "";
         public List<JunctionSetting> settings = new List<JunctionSetting>();
@@ -89,8 +89,9 @@ namespace DvMod.RemoteDispatch
     ///
     /// Junctions are never thrown under a car: anything not clear is deferred and
     /// retried until it is. Each route reserves the junctions it needs, so two
-    /// routes cannot fight over the same switch; a train leaving a station
-    /// outranks one approaching, so departures are not held by arrivals.
+    /// routes cannot fight over the same switch. Contested junctions go to the
+    /// train with the shortest remaining approach; route priority only breaks a
+    /// near tie.
     public static class Routing
     {
         private static readonly Dictionary<string, TrainRoute> routes = new Dictionary<string, TrainRoute>();
@@ -98,6 +99,7 @@ namespace DvMod.RemoteDispatch
         private static int nextRouteId = 1;
 
         public const float RetryIntervalSeconds = 1f;
+        public const float JunctionPriorityHysteresisMeters = 25f;
 
         /// Direction of a track at one of its ends, taken from the segment
         /// nearest that end.
@@ -992,7 +994,7 @@ namespace DvMod.RemoteDispatch
         private static int ConflictLimit(TrainRoute route, out string heldBy)
         {
             heldBy = "";
-            foreach (var setting in route.settings.OrderBy(s => s.pathIndex))
+            foreach (var setting in PendingSettings(route).OrderBy(s => s.pathIndex))
             {
                 if (!reservations.TryGetValue(setting.junction, out var ownerId) || ownerId == route.id)
                     continue;
@@ -1003,21 +1005,80 @@ namespace DvMod.RemoteDispatch
                     .FirstOrDefault(s => s.junction == setting.junction);
                 if (ownerSetting == null || ownerSetting.branch == setting.branch)
                     continue;
-                if (route.priority > owner.priority)
+                var challengerDistance = DistanceToJunction(route, setting);
+                var ownerDistance = DistanceToJunction(owner, ownerSetting);
+                var challengerIsCloser = challengerDistance + JunctionPriorityHysteresisMeters
+                    < ownerDistance;
+                var approachesAreTied = Mathf.Abs(challengerDistance - ownerDistance)
+                    <= JunctionPriorityHysteresisMeters;
+                if (challengerIsCloser || (approachesAreTied && route.priority > owner.priority))
                 {
-                    // A departure outranks the inbound holder. Release the
-                    // entire allocation so its signal and junctions agree, then
-                    // let the retry coroutine allocate it again later.
+                    // Release the holder's entire allocation so its signal and
+                    // junctions agree, then let it compete again as the live
+                    // approach distances change.
                     ReleaseAllocation(owner);
                     owner.waitingForSignal = true;
                     owner.status = RouteStatus.Pending;
-                    owner.message = "Held for higher-priority departure " + route.id + ".";
+                    owner.message = "Held for nearer train on " + route.id + ".";
                     continue;
                 }
                 heldBy = "route " + ownerId + " (train " + owner.trainsetId + ")";
                 return setting.pathIndex;
             }
             return int.MaxValue;
+        }
+
+        /// Approximate along-road distance from the leading occupied route
+        /// component to a contested junction. The current component uses the
+        /// nearest bogie's real position; complete components ahead use their
+        /// rail length. This is stable, cheap at the one-second arbitration
+        /// cadence, and substantially fairer than reservation creation order.
+        private static float DistanceToJunction(TrainRoute route, JunctionSetting setting)
+        {
+            if (setting.pathIndex < route.progressIndex)
+                return float.PositiveInfinity;
+
+            var trainset = Trainset.allSets?.Find(set => set != null && set.id == route.trainsetId);
+            var occupied = new HashSet<RailTrack>();
+            Occupancy.TracksOccupiedBy(trainset, occupied);
+
+            var frontIndex = Mathf.Clamp(route.progressIndex, 0, setting.pathIndex);
+            for (var i = frontIndex; i <= setting.pathIndex && i < route.pathTracks.Count; i++)
+            {
+                if (occupied.Contains(route.pathTracks[i]))
+                    frontIndex = i;
+            }
+
+            var distance = 0f;
+            if (frontIndex < route.pathSteps.Count)
+            {
+                var exit = TrackGraph.EndPosition(route.pathSteps[frontIndex]);
+                var nearest = float.PositiveInfinity;
+                var cars = trainset?.cars;
+                if (cars != null)
+                {
+                    foreach (var car in cars)
+                    {
+                        if (car == null || car.Bogies == null)
+                            continue;
+                        foreach (var bogie in car.Bogies)
+                        {
+                            if (bogie == null || bogie.track != route.pathTracks[frontIndex]
+                                || bogie.traveller == null)
+                                continue;
+                            var p = bogie.traveller.worldPosition;
+                            var position = new Vector3((float)p.x, (float)p.y, (float)p.z);
+                            nearest = Mathf.Min(nearest, Vector3.Distance(position, exit));
+                        }
+                    }
+                }
+                distance = float.IsPositiveInfinity(nearest)
+                    ? TrackGraph.TrackLength(route.pathTracks[frontIndex]) : nearest;
+            }
+
+            for (var i = frontIndex + 1; i <= setting.pathIndex && i < route.pathTracks.Count; i++)
+                distance += TrackGraph.TrackLength(route.pathTracks[i]);
+            return distance;
         }
 
         /// Take any junction that has become available since the road was laid,
