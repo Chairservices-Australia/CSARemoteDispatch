@@ -3,6 +3,34 @@ const earthCircumference = 40e6;
 const metersToDegrees = 360 / earthCircumference;
 
 /////////////////////
+// server requests
+
+// Every endpoint that can fail answers with a JSON {error} body, but a few
+// still reply with no body at all - a 204, an auth challenge, or a dropped
+// connection. Handing an empty body to JSON.parse is what produced
+// "unexpected end of data at line 1 column 1", which told the user nothing
+// about what had actually gone wrong. Read the body as text first, and treat
+// "empty" and "not JSON" as their own outcomes.
+function fetchJson(url, options) {
+  return fetch(url, options).then(response =>
+    response.text().then(text => {
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          throw new Error(`The server sent a malformed reply (${response.status}).`);
+        }
+      }
+      if (!response.ok)
+        throw new Error((data && data.error) || `Request failed (${response.status}).`);
+      if (data === null)
+        throw new Error('The server sent an empty reply.');
+      return data;
+    }));
+}
+
+/////////////////////
 // map
 
 const canvasRenderer = L.canvas();
@@ -544,8 +572,7 @@ function createTrackLabels(trackId, coords) {
   }
 }
 
-const tracksReady = fetch(new URL('/track', location))
-.then(resp => resp.json())
+const tracksReady = fetchJson(new URL('/track', location))
 .then(tracks => {
   Object.entries(tracks).forEach(([trackId, coords]) => {
     const isSiding = !trackId.includes('#');
@@ -604,8 +631,7 @@ function applyStationLabelVisibility() {
   }
 }
 
-const stationsReady = fetch(new URL('/station', location))
-  .then(response => response.json())
+const stationsReady = fetchJson(new URL('/station', location))
   .then(stations => {
     const sorted = [...stations].sort((a, b) => a.name.localeCompare(b.name));
     for (const station of sorted) {
@@ -696,7 +722,21 @@ routeStationSelect.addEventListener('input', updateRouteTrackList);
 
 // Bright green over the booked road, so where a train is going reads at a
 // glance without tracing junctions by eye.
-const routeHighlightColor = '#00e676';
+// Roads are drawn in the order they were set. The index comes from the host,
+// so the same road is the same colour on every player's map.
+const routeColors = [
+  '#00e676', '#ff9100', '#40c4ff', '#ff4081', '#ffea00',
+  '#b388ff', '#ff5252', '#1de9b6', '#c6ff00', '#8c9eff',
+];
+
+function routeColor(route) {
+  const index = Number.isInteger(route.colorIndex) ? route.colorIndex : 0;
+  return routeColors[((index % routeColors.length) + routeColors.length) % routeColors.length];
+}
+
+function routeOrder(route) {
+  return Number.isInteger(route.sequence) ? route.sequence : 0;
+}
 const highlightedTracks = new Set();
 
 function baseTrackColor(trackId) {
@@ -706,33 +746,50 @@ function baseTrackColor(trackId) {
 }
 
 function applyRouteHighlight(routes) {
-  const routed = new Set();
+  // Where two roads cross they share a track, and only one colour can be drawn
+  // on it. The earlier road keeps it: picking by creation order means the
+  // colour is stable, rather than depending on the order the list arrived in.
+  const colorByTrack = new Map();
+  const orderByTrack = new Map();
   for (const route of routes) {
     if (route.status === 'Failed' || route.status === 'Cleared')
       continue;
-    for (const trackId of route.tracks || [])
-      routed.add(trackId);
+    const color = routeColor(route);
+    const order = routeOrder(route);
+    for (const trackId of route.tracks || []) {
+      if (orderByTrack.has(trackId) && orderByTrack.get(trackId) <= order)
+        continue;
+      orderByTrack.set(trackId, order);
+      colorByTrack.set(trackId, color);
+    }
   }
 
   for (const trackId of highlightedTracks) {
-    if (routed.has(trackId))
+    if (colorByTrack.has(trackId))
       continue;
     const polyline = trackPolyLines.get(trackId);
     if (polyline)
       polyline.setStyle({ color: baseTrackColor(trackId), weight: 3 });
   }
 
-  for (const trackId of routed) {
+  for (const [trackId, color] of colorByTrack) {
     const polyline = trackPolyLines.get(trackId);
     if (!polyline)
       continue;
-    polyline.setStyle({ color: routeHighlightColor, weight: 5 });
+    polyline.setStyle({ color: color, weight: 5 });
     polyline.bringToFront();
   }
 
   highlightedTracks.clear();
-  for (const trackId of routed)
+  for (const trackId of colorByTrack.keys())
     highlightedTracks.add(trackId);
+}
+
+function appendCell(row, text) {
+  const cell = document.createElement('td');
+  cell.textContent = text;
+  row.appendChild(cell);
+  return cell;
 }
 
 function renderRoutes(routes) {
@@ -740,10 +797,27 @@ function renderRoutes(routes) {
   routeListBody.innerHTML = '';
   for (const route of routes) {
     const row = document.createElement('tr');
-    row.innerHTML =
-      `<td>${route.trainsetId}</td>` +
-      `<td>${route.destinationTrack}</td>` +
-      `<td class="routeStatus routeStatus-${route.status}" title="${route.message}">${route.status}</td>`;
+
+    // The swatch is what ties a row to the coloured road on the map, and the
+    // number says where it came in the order.
+    const marker = document.createElement('td');
+    const dot = document.createElement('span');
+    dot.className = 'routeSwatch';
+    dot.style.backgroundColor = routeColor(route);
+    marker.appendChild(dot);
+    marker.appendChild(document.createTextNode(String(routeOrder(route))));
+    marker.title = 'Roads are numbered and coloured in the order they were set.';
+    row.appendChild(marker);
+
+    appendCell(row, route.trainsetId);
+    appendCell(row, route.destinationTrack);
+    // Built as text rather than interpolated markup: track and signal names
+    // come from the world and from other mods, and a quote in one of them used
+    // to break out of the title attribute.
+    const status = appendCell(row, route.status);
+    status.className = `routeStatus routeStatus-${route.status}`;
+    status.title = route.message || '';
+
     const actions = document.createElement('td');
     const clear = document.createElement('button');
     clear.textContent = 'Clear';
@@ -751,21 +825,33 @@ function renderRoutes(routes) {
     actions.appendChild(clear);
     row.appendChild(actions);
     routeListBody.appendChild(row);
+
+    // Some of these are instructions the driver has to act on - draw forward
+    // past a signal and set back, or stand short of a crossing until it clears
+    // - so they belong in the list, not hidden in a tooltip.
+    if (route.message) {
+      const note = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 5;
+      cell.className = 'routeMessage'
+        + (route.status === 'AwaitingReversal' ? ' routeMessage-action' : '');
+      cell.textContent = route.message;
+      note.appendChild(cell);
+      routeListBody.appendChild(note);
+    }
   }
 }
 
 function refreshRoutes() {
-  return fetch(new URL('/route', location))
-    .then(response => response.json())
+  return fetchJson(new URL('/route', location))
     .then(renderRoutes)
     .catch(() => {});
 }
 
 function clearRoute(routeId) {
-  fetch(new URL(`/route/${routeId}/clear`, location), { method: 'POST', body: '' })
-    .then(response => response.json())
+  fetchJson(new URL(`/route/${routeId}/clear`, location), { method: 'POST', body: '' })
     .then(renderRoutes)
-    .catch(() => {});
+    .catch(error => { routeMessage.textContent = error.message || 'Could not clear the route.'; });
 }
 
 // Detect the consist the player is riding in and the job it is working, so
@@ -818,8 +904,7 @@ function applyAutoSelection() {
 }
 
 function refreshCurrentTrain() {
-  return fetch(new URL('/currentTrain', location))
-    .then(response => response.json())
+  return fetchJson(new URL('/currentTrain', location))
     .then(current => {
       const status = document.getElementById('routeCurrentTrain');
       if (!current.inTrain || current.trainsetId < 0) {
@@ -861,10 +946,7 @@ document.getElementById('routeSetButton')
       return;
     }
     routeMessage.textContent = 'Planning...';
-    fetch(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST', body: '' })
-      .then(response => response.status === 403
-        ? Promise.reject(new Error('No junction permission. Enable it for your user in the CSA Remote Dispatch settings in Unity Mod Manager.'))
-        : response.json())
+    fetchJson(new URL(`/route/${trainsetId}/${encodeURIComponent(trackId)}`, location), { method: 'POST', body: '' })
       .then(route => {
         routeMessage.textContent = route.message || route.status;
         refreshRoutes();
@@ -877,8 +959,7 @@ document.getElementById('routeSetButton')
 
 let junctions = [];
 const junctionsReady = tracksReady
-.then(_ => fetch(new URL('/junction', location)))
-.then(resp => resp.json())
+.then(_ => fetchJson(new URL('/junction', location)))
 .then(allJunctionData =>
   junctions = allJunctionData.map((data, index) => ({
     marker: createJunctionMarker(data.position, index),
@@ -887,8 +968,7 @@ const junctionsReady = tracksReady
 );
 
 function toggleJunction(junctionId) {
-  fetch(new URL(`/junction/${junctionId}/toggle`, location), { method: 'POST' })
-  .then(resp => resp.json())
+  fetchJson(new URL(`/junction/${junctionId}/toggle`, location), { method: 'POST' })
   .then(selectedBranch => updateJunctionOverlay(junctionId, selectedBranch))
   .catch(err => {});
 }
@@ -1038,12 +1118,12 @@ function scrollToTrack(trackId) {
     map.panTo(polyLine.getCenter());
 }
 
-fetch(new URL('/player', location))
-.then(resp => resp.json())
+fetchJson(new URL('/player', location))
 .then(data => {
   updatePlayerOverlays(data);
   zoomToAllPlayers();
-});
+})
+.catch(() => {});
 
 /////////////////////
 // loco control
@@ -1122,8 +1202,7 @@ function getControlledLocoGuid() {
 function getControlledLocoData() {
   const guid = getControlledLocoGuid();
   if (guid) {
-    return fetch(`/car/${guid}`, location)
-    .then(resp => resp.json());
+    return fetchJson(new URL(`/car/${guid}`, location));
   }
 }
 
@@ -1150,7 +1229,10 @@ function updateLocoThrottleInput(carData) {
 }
 
 function updateLocoDisplay() {
-  getControlledLocoData()
+  const pending = getControlledLocoData();
+  if (!pending)
+    return;
+  pending
   .then(carData => {
     locoBrakePipeDisplay.textContent = carData.brakePipe.toFixed(1);
     locoSpeedDisplay.textContent = carData.forwardSpeed.toFixed(0);
@@ -1159,7 +1241,8 @@ function updateLocoDisplay() {
     updateReverserButtons(carData.reverser);
     updateLocoThrottleInput(carData);
     updateCouplingControls(carData);
-  });
+  })
+  .catch(() => {});
 }
 
 let locoControlRefreshIntervalId;
@@ -1383,8 +1466,7 @@ let updateStart;
 
 function updateOnce() {
   updateStart = performance.now();
-  return fetch(new URL(`/updates/${sessionId}`, location))
-  .then(resp => resp.json())
+  return fetchJson(new URL(`/updates/${sessionId}`, location))
   .then(updateData => {
     Object.entries(updateData).forEach(([tag, data]) => {
       switch (tag) {
@@ -1419,10 +1501,14 @@ function updateOnce() {
 }
 
 function updateLoop() {
+  // Reschedule whatever happened. A rejected poll - the game shutting down, a
+  // dropped connection, a reply that could not be parsed - used to leave this
+  // chain unresolved, which silently ended live updates for the whole session.
   updateOnce()
+  .catch(() => {})
   .then(_ => {
     const timeToNextUpdate = (updateStart + updateInterval) - performance.now();
-    setTimeout(updateLoop, timeToNextUpdate);
+    setTimeout(updateLoop, Math.max(0, timeToNextUpdate));
   });
 }
 

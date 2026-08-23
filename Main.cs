@@ -105,6 +105,7 @@ namespace DvMod.RemoteDispatch
 
         private static void Start()
         {
+            RouteNetwork.Initialise();
             HttpServer.Create();
             SignalHud.Create();
             Updater.Create();
@@ -118,8 +119,11 @@ namespace DvMod.RemoteDispatch
             HttpServer.Destroy();
             SignalHud.Destroy();
             Routing.ClearAll();
+            RouteNetwork.Shutdown();
+            RouteNetwork.Reset();
             SpeedSigns.Reset();
             Signalling.Reset();
+            Occupancy.Reset();
             RailTracks.ResetCache();
         }
 

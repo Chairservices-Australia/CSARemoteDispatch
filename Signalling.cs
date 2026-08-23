@@ -59,7 +59,33 @@ namespace DvMod.RemoteDispatch
         /// other end of the train the moment it stops.
         private static readonly Dictionary<int, Vector3> lastHeadings = new Dictionary<int, Vector3>();
 
-        public static void Reset() => lastHeadings.Clear();
+        /// Resolved once per signal; see CouplingAspectIndex.
+        private static readonly Dictionary<Signals.Game.Signal, int> couplingAspectIndices =
+            new Dictionary<Signals.Game.Signal, int>();
+
+        /// Scratch space for the tracks of the block being examined. This is
+        /// read once per signal per refresh, where projecting the block's track
+        /// list with LINQ would allocate on every one of them.
+        private static readonly List<RailTrack> blockTrackBuffer = new List<RailTrack>();
+
+        public static void Reset()
+        {
+            lastHeadings.Clear();
+            couplingAspectIndices.Clear();
+            blockTrackBuffer.Clear();
+        }
+
+        private static List<RailTrack> BlockTracks(TrackBlock block)
+        {
+            blockTrackBuffer.Clear();
+            var tracks = block.Tracks;
+            if (tracks != null)
+            {
+                for (var i = 0; i < tracks.Length; i++)
+                    blockTrackBuffer.Add(tracks[i].Track);
+            }
+            return blockTrackBuffer;
+        }
 
         /// Read the line ahead of the train the player is in.
         public static Reading ReadForPlayer()
@@ -95,7 +121,8 @@ namespace DvMod.RemoteDispatch
             // Prefer the limit the game actually posts; fall back to the figure
             // derived from curvature only for the initial block. SpeedSigns
             // latches either value until the leading end crosses another sign.
-            SpeedSigns.ScanIfDue();
+            // Discovering the signs is left to SpeedSigns' own coroutine; doing
+            // it from here put a world scan on the same timer as the readout.
             var speed = SpeedSigns.LimitAt(
                 ownTrainsetId, leadCar, heading,
                 () => Mathf.Max(DefaultSpeedLimitKph, SpeedLimitFor(start.Value)));
@@ -128,7 +155,7 @@ namespace DvMod.RemoteDispatch
             // locomotive occupies the block, DV Signals remains authoritative.
             var block = signal.Block;
             if (block != null && Occupancy.ContainsOnlyUnpoweredCars(
-                block.Tracks.Select(info => info.Track), ownTrainsetId))
+                BlockTracks(block), ownTrainsetId))
             {
                 aspect = Aspect.PreliminaryCaution;
                 passToCouple = true;
@@ -226,22 +253,51 @@ namespace DvMod.RemoteDispatch
                     || __instance.Operation != SignalOperationMode.Automatic)
                     return;
 
+                // Only a signal that would otherwise hold the train needs a
+                // permissive indication. Testing the aspect first keeps the
+                // occupancy lookup off the great majority of signals, which are
+                // already showing a proceed aspect and are refreshed constantly.
+                var current = __instance.CurrentAspect;
+                if (current == null || !current.DisallowPassing)
+                    return;
+
                 var block = __instance.Block;
-                if (block == null || !Occupancy.ContainsOnlyUnpoweredCars(
-                    block.Tracks.Select(info => info.Track)))
+                if (block == null || !Occupancy.ContainsOnlyUnpoweredCars(BlockTracks(block)))
                     return;
 
                 // Use the active pack's own flashing-amber aspect, retaining its
                 // lamp animation and DVSignals aspect-change notifications.
-                for (var i = 0; i < __instance.AllAspects.Length; i++)
+                var index = CouplingAspectIndex(__instance);
+                if (index >= 0)
+                    __instance.ChangeAspect(index);
+            }
+
+            /// Which of a signal's aspects is its flashing amber. Fixed by the
+            /// pack the signal was built from, so it is resolved once rather
+            /// than by re-inspecting every aspect definition on each refresh.
+            private static int CouplingAspectIndex(Signals.Game.Signal signal)
+            {
+                if (couplingAspectIndices.TryGetValue(signal, out var cached))
+                    return cached;
+
+                var found = -1;
+                var aspects = signal.AllAspects;
+                for (var i = 0; i < aspects.Length && found < 0; i++)
                 {
-                    var definition = __instance.AllAspects[i].GetDefinition();
-                    var blinking = definition.BlinkingLights ?? new SignalLightDefinition[0];
-                    if (!blinking.Any(light => IsAmber(light.Colour)))
+                    var blinking = aspects[i].GetDefinition().BlinkingLights;
+                    if (blinking == null)
                         continue;
-                    __instance.ChangeAspect(i);
-                    return;
+                    for (var j = 0; j < blinking.Length; j++)
+                    {
+                        if (blinking[j] != null && IsAmber(blinking[j].Colour))
+                        {
+                            found = i;
+                            break;
+                        }
+                    }
                 }
+                couplingAspectIndices[signal] = found;
+                return found;
             }
         }
 

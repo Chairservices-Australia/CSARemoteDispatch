@@ -23,7 +23,26 @@ namespace DvMod.RemoteDispatch
         private static readonly Texture2D?[] lampTextures = new Texture2D?[6];
 
         private static GUIStyle? speedTextStyle;
+        private static GUIStyle? messageStyle;
         private static Font? signFont;
+
+        /// Whether the font search has been run. Distinct from signFont being
+        /// set, because "no candidate is installed" is a valid, final answer.
+        private static bool signFontResolved;
+
+        // OnGUI runs several times per frame, so everything it would otherwise
+        // rebuild on each pass - content objects, formatted text, glyph
+        // measurements - is held here and refreshed only when it changes.
+        private static readonly GUIContent speedContent = new GUIContent();
+        private static readonly GUIContent messageContent = new GUIContent();
+        private static int cachedSpeedKph = int.MinValue;
+        private static string cachedSpeedText = "";
+        private static Vector2 cachedSpeedSize;
+        private static Font? cachedSpeedSizeFont;
+        private static bool speedSizeValid;
+        private static string cachedMessageText = "";
+        private static string cachedMessageSource = "";
+        private static int cachedDistanceKey = int.MinValue;
 
         /// Speed signs are set in DIN 1451, the road-sign face. Bahnschrift is
         /// Microsoft's cut of it and ships with Windows; the rest are condensed
@@ -60,6 +79,38 @@ namespace DvMod.RemoteDispatch
                 return;
             Object.Destroy(rootObject);
             rootObject = null;
+            ReleaseGraphics();
+        }
+
+        /// The generated textures and the dynamic font are HideAndDontSave, so
+        /// nothing else collects them. Without this a reload leaks a full set
+        /// every time the mod is toggled.
+        private static void ReleaseGraphics()
+        {
+            if (speedSignTexture != null)
+                Object.Destroy(speedSignTexture);
+            speedSignTexture = null;
+            if (signalBodyTexture != null)
+                Object.Destroy(signalBodyTexture);
+            signalBodyTexture = null;
+            for (var i = 0; i < lampTextures.Length; i++)
+            {
+                if (lampTextures[i] != null)
+                    Object.Destroy(lampTextures[i]);
+                lampTextures[i] = null;
+            }
+
+            speedTextStyle = null;
+            messageStyle = null;
+            if (signFont != null)
+                Object.Destroy(signFont);
+            signFont = null;
+            signFontResolved = false;
+            cachedSpeedKph = int.MinValue;
+            cachedSpeedSizeFont = null;
+            speedSizeValid = false;
+            cachedMessageSource = "";
+            cachedDistanceKey = int.MinValue;
         }
 
         public void Update()
@@ -69,12 +120,18 @@ namespace DvMod.RemoteDispatch
                 && Input.GetKeyDown(hotkey))
             {
                 Main.settings.showSignalHud = !Main.settings.showSignalHud;
+                // Read again at once, so switching the HUD on shows the line
+                // ahead immediately rather than at the next scheduled read.
+                nextReadTime = 0f;
                 if (Main.mod != null)
                     Main.settings.Save(Main.mod);
             }
 
-            // Reading the line walks track and scans every car, so it runs a few
-            // times a second rather than every frame.
+            // Reading the line walks track and scans cars, so it runs a few
+            // times a second rather than every frame - and not at all while the
+            // HUD is hidden, which is the point of being able to hide it.
+            if (!Main.settings.showSignalHud)
+                return;
             if (Time.time < nextReadTime)
                 return;
             nextReadTime = Time.time + 0.25f;
@@ -143,18 +200,42 @@ namespace DvMod.RemoteDispatch
         private static void DrawSignalMessage(
             Rect rect, string message, float distanceMeters, Color colour)
         {
-            var style = new GUIStyle(GUI.skin.label)
+            if (messageStyle == null)
             {
-                alignment = TextAnchor.UpperCenter,
-                fontSize = 13,
-                fontStyle = FontStyle.Bold,
-                wordWrap = true,
-            };
-            style.normal.textColor = colour;
+                messageStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.UpperCenter,
+                    fontSize = 13,
+                    fontStyle = FontStyle.Bold,
+                    wordWrap = true,
+                };
+            }
+            messageStyle.normal.textColor = colour;
+            messageContent.text = MessageText(message, distanceMeters);
+            GUI.Label(rect, messageContent, messageStyle);
+        }
+
+        /// The panel text, composed only when what it says actually changes.
+        ///
+        /// The approach figure is shown to 0.1 km above a kilometre and to the
+        /// metre below it, so it is keyed at whichever of those the readout can
+        /// actually distinguish rather than on the raw distance.
+        private static string MessageText(string message, float distanceMeters)
+        {
+            var key = distanceMeters < 0f ? int.MinValue
+                : distanceMeters >= 1000f ? -Mathf.RoundToInt(distanceMeters / 100f)
+                : Mathf.RoundToInt(distanceMeters);
+            if (key == cachedDistanceKey
+                && string.Equals(cachedMessageSource, message, System.StringComparison.Ordinal))
+                return cachedMessageText;
+
+            cachedDistanceKey = key;
+            cachedMessageSource = message;
             var distance = distanceMeters < 0f ? "" : distanceMeters >= 1000f
                 ? "\nApproaching: " + (distanceMeters / 1000f).ToString("0.0") + " km"
                 : "\nApproaching: " + Mathf.RoundToInt(distanceMeters) + " m";
-            GUI.Label(rect, message + distance, style);
+            cachedMessageText = message + distance;
+            return cachedMessageText;
         }
 
         private void DrawSpeedSign(Rect rect, int kph)
@@ -162,23 +243,36 @@ namespace DvMod.RemoteDispatch
             if (speedSignTexture != null)
                 GUI.DrawTexture(rect, speedSignTexture);
 
-            var text = kph.ToString();
+            if (kph != cachedSpeedKph)
+            {
+                cachedSpeedKph = kph;
+                cachedSpeedText = kph.ToString();
+                speedSizeValid = false;
+            }
+            speedContent.text = cachedSpeedText;
+
             // Three digits have to sit inside the same ring as two, so the face
             // is set narrower rather than letting the number overrun the border.
-            var fontSize = Mathf.RoundToInt(SignSize * (text.Length >= 3 ? 0.36f : 0.46f));
+            var fontSize = Mathf.RoundToInt(SignSize * (cachedSpeedText.Length >= 3 ? 0.36f : 0.46f));
             var style = SpeedTextStyle(fontSize);
 
             // Centred by measuring the glyphs rather than by anchoring: label
             // styles carry padding and the line box is taller than the digits,
-            // both of which push an anchored number off centre.
-            var content = new GUIContent(text);
-            var size = style.CalcSize(content);
+            // both of which push an anchored number off centre. The measurement
+            // only moves when the number or the resolved face does.
+            if (!speedSizeValid || cachedSpeedSizeFont != style.font)
+            {
+                cachedSpeedSize = style.CalcSize(speedContent);
+                cachedSpeedSizeFont = style.font;
+                speedSizeValid = true;
+            }
+            var size = cachedSpeedSize;
             var textRect = new Rect(
                 rect.x + (rect.width - size.x) / 2f,
                 rect.y + (rect.height - size.y) / 2f,
                 size.x,
                 size.y);
-            GUI.Label(textRect, content, style);
+            GUI.Label(textRect, speedContent, style);
         }
 
         private static GUIStyle SpeedTextStyle(int fontSize)
@@ -198,8 +292,14 @@ namespace DvMod.RemoteDispatch
                 speedTextStyle.normal.background = null;
             }
 
-            if (signFont == null)
+            // Resolved once. Enumerating the installed fonts is expensive, and
+            // on a system carrying none of the candidates the answer is null -
+            // which must not be retried, because this runs on every draw.
+            if (!signFontResolved)
+            {
+                signFontResolved = true;
                 signFont = LoadSignFont();
+            }
             speedTextStyle.font = signFont;
             speedTextStyle.fontStyle = signFont == null ? FontStyle.Bold : FontStyle.Normal;
             speedTextStyle.fontSize = fontSize;

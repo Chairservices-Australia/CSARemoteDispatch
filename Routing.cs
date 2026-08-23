@@ -17,7 +17,7 @@ namespace DvMod.RemoteDispatch
         public int pathIndex;  // position along the route, for releasing behind the train
     }
 
-    public enum RouteStatus { Active, Pending, Conflict, Failed, Cleared }
+    public enum RouteStatus { Active, Pending, Conflict, Failed, Cleared, AwaitingReversal }
 
     public class TrainRoute
     {
@@ -46,6 +46,41 @@ namespace DvMod.RemoteDispatch
         public float offRouteSince;
         public float wrongWaySince;
         public string notice = "";   // survives status updates
+
+        // A road that changes direction partway. The train runs out along the
+        // first leg, stands clear, then draws back over the same junction onto
+        // the second. Only one leg is ever the live path: the machinery that
+        // tracks progress and releases junctions behind the train assumes a
+        // road is travelled once, in one direction, which a single leg is.
+        public bool hasReverseLeg;
+        public bool onReverseLeg;
+        public List<TrackGraph.Step> reverseSteps = new List<TrackGraph.Step>();
+        public List<RailTrack> reverseTracks = new List<RailTrack>();
+        public List<string> reverseTrackIds = new List<string>();
+        public Junction? reversalJunction;
+        public string reversalTrackId = "";
+        public string reversalSignalName = "";
+        public float runOutMeters;
+
+        /// How far along the road the allocation currently extends, as a path
+        /// index. Everything before this has its junctions set and reserved;
+        /// everything from here on belongs to someone else for now. Advances as
+        /// the train in front clears.
+        public int allocatedUpTo = int.MaxValue;
+        public string heldShortOf = "";
+
+        /// The player whose request laid this road, in a session. Empty in
+        /// single player, where there is only one.
+        public string requestedBy = "";
+
+        /// Which road this is, counting from the first laid this session, and
+        /// which of the page's colours draws it. Both are decided here rather
+        /// than by each page, so every player sees the same road in the same
+        /// colour - a client's list is a copy of this one, and a colour worked
+        /// out from a position in that list would differ between players as
+        /// their lists changed.
+        public int sequence;
+        public int colorIndex;
     }
 
     /// Route planning and safe junction setting.
@@ -227,6 +262,26 @@ namespace DvMod.RemoteDispatch
 
         /// True when the train starts on a station track, which gives its route
         /// precedence over trains running towards that station.
+        /// How many distinct colours the page draws roads in.
+        public const int RouteColorCount = 10;
+
+        /// The lowest colour no live road is using.
+        ///
+        /// Recycled rather than simply counting up, so clearing a road frees its
+        /// colour for the next one. Only a handful are ever live at once, so in
+        /// practice no two roads on screen share a colour, and the numbering
+        /// carries the order they were set in.
+        private static int NextFreeColorIndex()
+        {
+            var taken = new HashSet<int>(routes.Values.Select(route => route.colorIndex));
+            for (var i = 0; i < RouteColorCount; i++)
+            {
+                if (!taken.Contains(i))
+                    return i;
+            }
+            return routes.Count % RouteColorCount;
+        }
+
         private static int PriorityFor(RailTrack startTrack)
         {
             if (startTrack == null)
@@ -257,6 +312,9 @@ namespace DvMod.RemoteDispatch
 
         public static void ClearRoute(string id)
         {
+            if (RouteNetwork.RequestClear(id))
+                return;
+
             if (!routes.TryGetValue(id, out var route))
                 return;
             ReleaseAllocation(route);
@@ -271,18 +329,48 @@ namespace DvMod.RemoteDispatch
                 ReleaseAllocation(route);
             routes.Clear();
             reservations.Clear();
+            lastPublishedJson = "";
             Sessions.AddTag("routes");
+        }
+
+        /// Plan and allocate a road, as the host does on behalf of a player.
+        /// The requester is named so everyone can see whose train it is.
+        public static void SetRouteAsAuthority(int trainsetId, string destinationTrackId, string requestedBy)
+        {
+            var trainset = Trainset.allSets?.Find(set => set.id == trainsetId);
+            var destination = FindTrack(destinationTrackId);
+            if (trainset == null || destination == null)
+            {
+                Main.DebugLog(() => $"Route request from {requestedBy} for train {trainsetId} "
+                    + $"to {destinationTrackId} could not be resolved.");
+                return;
+            }
+            var route = SetRoute(trainset, destination, destinationTrackId);
+            route.requestedBy = requestedBy;
         }
 
         /// Plan and apply a route for a trainset to a destination track.
         public static TrainRoute SetRoute(Trainset trainset, RailTrack destination, string destinationTrackId)
         {
+            var sequence = nextRouteId++;
             var route = new TrainRoute
             {
-                id = "r" + nextRouteId++,
+                id = "r" + sequence,
                 trainsetId = trainset.id,
                 destinationTrackId = destinationTrackId,
+                sequence = sequence,
+                colorIndex = NextFreeColorIndex(),
             };
+
+            // In a session the world belongs to the host: it holds every other
+            // player's roads, so only there can this one be weighed against
+            // them. The answer arrives as a broadcast of the host's whole list.
+            if (RouteNetwork.RequestRoute(trainset.id, destinationTrackId))
+            {
+                route.status = RouteStatus.Pending;
+                route.message = "Requested from the session host...";
+                return route;
+            }
 
             var candidates = StartCandidates(trainset).ToList();
             if (candidates.Count == 0)
@@ -296,12 +384,7 @@ namespace DvMod.RemoteDispatch
             // The consist occupies several tracks; a road that immediately runs
             // back through the train itself is not usable.
             var occupied = new HashSet<RailTrack>();
-            foreach (var position in Occupancy.AllCarPositions())
-            {
-                var set = position.car.trainset;
-                if (set != null && set.id == trainset.id)
-                    occupied.Add(position.track);
-            }
+            Occupancy.TracksOccupiedBy(trainset, occupied);
 
             // One logical destination can consist of multiple RailTrack objects
             // (and modded layouts commonly duplicate an ID across their physical
@@ -338,13 +421,54 @@ namespace DvMod.RemoteDispatch
                 }
             }
 
-            if (path == null)
+            // Where no single-direction road exists - or where one exists but
+            // is far enough round to be worse than stopping and changing ends -
+            // look for a road that runs out and sets back.
+            var reversal = PlanReversal(candidates, goals, ConsistLength(trainset));
+            var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
+
+            if (path == null && !useReversal)
             {
                 var reach = candidates.Select(c => TrackGraph.CountReachable(c)).ToList();
                 route.status = RouteStatus.Failed;
                 route.message = "No route found to " + DescribeTrack(destination)
                     + " from " + DescribeTrack(candidates[0].track)
                     + " (reachable states: " + string.Join(", ", reach) + ").";
+                routes[route.id] = route;
+                return route;
+            }
+
+            if (useReversal)
+            {
+                var plan = reversal!;
+                chosen = plan.start;
+                // Only the outbound leg is laid now. The rest is set once the
+                // train stands clear, because the junction it sets back over has
+                // to lie the other way for the second leg and cannot do both.
+                path = plan.outbound;
+                shortestLength = plan.outboundMeters + plan.inboundMeters;
+
+                route.hasReverseLeg = true;
+                route.reverseSteps = plan.inbound;
+                route.reverseTracks = plan.inbound.Select(step => step.track).ToList();
+                route.reverseTrackIds = TrackIdsOf(plan.inbound);
+                route.runOutMeters = plan.runOutMeters;
+                route.reversalTrackId = DescribeTrack(plan.inbound[0].track);
+                // The turnout to stand clear of is the one the train came
+                // through to reach the place it stops.
+                route.reversalJunction = plan.outbound.Count >= 2
+                    ? plan.outbound[plan.outbound.Count - 2].ExitJunction
+                    : null;
+                route.reversalSignalName = SignalBeforeReversal(plan, trainset);
+            }
+
+            if (path == null)
+            {
+                // Unreachable: either a direct road was found or a reversal plan
+                // supplied one. Stated rather than asserted so a future change
+                // to the two branches above cannot fall through silently.
+                route.status = RouteStatus.Failed;
+                route.message = "Could not lay a road to " + DescribeTrack(destination) + ".";
                 routes[route.id] = route;
                 return route;
             }
@@ -360,11 +484,7 @@ namespace DvMod.RemoteDispatch
             route.pathSteps = path;
             // FullDisplayID, matching both the /track keys the map draws with and
             // the IDs the game prints on jobs.
-            route.trackIds = path
-                .Select(step => step.track.LogicTrack())
-                .Where(track => track != null)
-                .Select(track => track.ID.FullDisplayID)
-                .ToList();
+            route.trackIds = TrackIdsOf(path);
             route.settings = SettingsForPath(path);
             CountDivergences(path, route);
 
@@ -374,20 +494,200 @@ namespace DvMod.RemoteDispatch
             return route;
         }
 
-        private static bool TryActivate(TrainRoute route)
+        /// The longest run-out considered when looking for somewhere to change
+        /// ends, and how many candidate places are searched from. Both bound
+        /// what would otherwise be a search from every state in the network.
+        private const float MaxRunOutMeters = 3000f;
+        private const int MaxReversalProbes = 24;
+
+        /// What a reversal costs, as a distance equivalent, when weighed against
+        /// a road that never changes direction. Stopping, walking to the other
+        /// end and setting back takes real time, so a somewhat longer through
+        /// road is still the better move.
+        private const float ReversalPenaltyMeters = 800f;
+
+        private sealed class ReversalPlan
         {
-            if (MultiplayerIntegration.IsMpRunning && !MultiplayerIntegration.IsHost)
+            public TrackGraph.Step start;
+            public List<TrackGraph.Step> outbound = new List<TrackGraph.Step>();
+            public List<TrackGraph.Step> inbound = new List<TrackGraph.Step>();
+            public float outboundMeters;
+            public float inboundMeters;
+            public float runOutMeters;
+
+            public float Cost => outboundMeters + inboundMeters + ReversalPenaltyMeters;
+        }
+
+        /// Plan a road that runs out one way, changes ends, and draws back.
+        ///
+        /// A train standing in a shed or siding whose destination lies back past
+        /// the turnout it must leave by cannot get there in one movement:
+        /// leaving commits it to the far side of that turnout. What a driver
+        /// does is pull out far enough to stand clear, then set back over it
+        /// onto the other road, and that is what this looks for.
+        private static ReversalPlan? PlanReversal(
+            List<TrackGraph.Step> candidates, HashSet<RailTrack> goals, float consistLength)
+        {
+            // One sweep out of the destination says which states can still reach
+            // it, so the thousands of places a train might stand can be filtered
+            // before paying for a search from any of them.
+            var reaching = TrackGraph.StatesReaching(goals);
+            if (reaching.Count == 0)
+                return null;
+
+            ReversalPlan? best = null;
+            foreach (var candidate in candidates)
             {
-                route.status = RouteStatus.Failed;
-                route.message = "Route allocation must be performed by the multiplayer host.";
+                var exploration = TrackGraph.Explore(
+                    candidate, MaxRunOutMeters, extraCost: LeftHandRunningPenalty);
+
+                // The train has to stand entirely beyond the turnout it will set
+                // back over, so a run-out shorter than the consist is no use
+                // however convenient the track. Measured from the start of the
+                // road rather than from the train's nose, which is the
+                // conservative direction to be wrong in.
+                var viable = exploration.cost
+                    .Where(entry => entry.Value >= consistLength
+                        && !entry.Key.Equals(candidate)
+                        && reaching.Contains(TrackGraph.Flip(entry.Key)))
+                    .OrderBy(entry => entry.Value + GoalDistance(TrackGraph.Flip(entry.Key), goals))
+                    .Take(MaxReversalProbes)
+                    .ToList();
+
+                foreach (var entry in viable)
+                {
+                    var inbound = TrackGraph.FindPath(
+                        TrackGraph.Flip(entry.Key), goals, extraCost: LeftHandRunningPenalty);
+                    if (inbound == null || inbound.Count == 0)
+                        continue;
+                    var outbound = exploration.PathTo(entry.Key);
+                    if (outbound.Count == 0)
+                        continue;
+
+                    var plan = new ReversalPlan
+                    {
+                        start = candidate,
+                        outbound = outbound,
+                        inbound = inbound,
+                        outboundMeters = PathLength(outbound),
+                        inboundMeters = PathLength(inbound),
+                        runOutMeters = entry.Value,
+                    };
+                    if (best == null || plan.Cost < best.Cost)
+                        best = plan;
+                }
+            }
+            return best;
+        }
+
+        /// Straight-line distance from where a step ends to the nearest goal,
+        /// used only to try the most promising reversal points first.
+        private static float GoalDistance(TrackGraph.Step step, HashSet<RailTrack> goals)
+        {
+            var from = TrackGraph.EndPosition(step);
+            var best = float.MaxValue;
+            foreach (var goal in goals)
+            {
+                var curve = goal == null ? null : goal.curve;
+                if (curve == null || curve.pointCount == 0)
+                    continue;
+                best = Mathf.Min(best, Vector3.Distance(from, curve[0].position));
+            }
+            return best == float.MaxValue ? 0f : best;
+        }
+
+        private static float ConsistLength(Trainset trainset)
+        {
+            var cars = trainset?.cars;
+            if (cars == null || cars.Count == 0)
+                return DefaultCarLengthMeters;
+            var total = 0f;
+            foreach (var car in cars)
+                total += car?.logicCar?.length ?? DefaultCarLengthMeters;
+            return Mathf.Max(DefaultCarLengthMeters, total);
+        }
+
+        private const float DefaultCarLengthMeters = 20f;
+
+        /// The signal standing between the train and the place it changes ends,
+        /// so the instruction can name the one the driver has to pass.
+        private static string SignalBeforeReversal(ReversalPlan plan, Trainset trainset)
+        {
+            var car = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(c => c != null);
+            if (car == null)
+                return "";
+            var controller = Signalling.NextDvSignalController(plan.start, car.transform.position);
+            return controller == null ? "" : controller.Name;
+        }
+
+        private static List<string> TrackIdsOf(List<TrackGraph.Step> path) => path
+            .Select(step => step.track.LogicTrack())
+            .Where(track => track != null)
+            .Select(track => track.ID.FullDisplayID)
+            .ToList();
+
+        /// True once the whole consist stands beyond the reversal point and off
+        /// the turnout it has to set back over.
+        private static bool ConsistClearOfReversal(TrainRoute route)
+        {
+            var occupied = new HashSet<RailTrack>();
+            Occupancy.TracksOccupiedBy(route.trainsetId, occupied);
+            if (occupied.Count == 0)
                 return false;
+
+            // Every part of the train must be on the far end of the outbound
+            // road: the reversal track itself, or something past it.
+            var reversalTrack = route.pathTracks.Count == 0
+                ? null : route.pathTracks[route.pathTracks.Count - 1];
+            if (reversalTrack == null)
+                return false;
+            foreach (var track in occupied)
+            {
+                if (track != reversalTrack)
+                    return false;
             }
 
-            var conflict = FirstConflict(route);
-            if (conflict != null)
+            // Nothing of ours may still be fouling the turnout, or setting back
+            // over it would derail the train.
+            return route.reversalJunction == null
+                || Occupancy.IsJunctionClear(route.reversalJunction);
+        }
+
+        /// Hand the road over to the second leg once the train stands clear.
+        private static void BeginReverseLeg(TrainRoute route)
+        {
+            // The outbound junctions are released outright: the second leg wants
+            // at least one of them lying the other way, so holding them would
+            // block the very move being set up.
+            ReleaseAllocation(route);
+
+            route.onReverseLeg = true;
+            route.pathSteps = route.reverseSteps;
+            route.pathTracks = route.reverseTracks;
+            route.trackIds = route.reverseTrackIds;
+            route.settings = SettingsForPath(route.reverseSteps);
+            route.progressIndex = 0;
+            route.releasedUpTo = 0;
+            route.allocatedUpTo = int.MaxValue;
+            route.pending.Clear();
+            route.wrongWaySince = 0f;
+            route.offRouteSince = 0f;
+            route.notice = "Reversing. ";
+            CountDivergences(route.reverseSteps, route);
+            TryActivate(route);
+        }
+
+        private static bool TryActivate(TrainRoute route)
+        {
+            var limit = ConflictLimit(route, out var heldBy);
+            route.allocatedUpTo = limit;
+            route.heldShortOf = heldBy;
+            if (limit <= route.progressIndex)
             {
+                // Not even the first junction ahead is free, so there is nothing
+                // to give the train yet.
                 route.status = RouteStatus.Pending;
-                route.message = "Waiting to allocate route: " + conflict;
+                route.message = "Waiting to allocate route: held by " + heldBy + ".";
                 route.allocationApplied = false;
                 return false;
             }
@@ -661,9 +961,19 @@ namespace DvMod.RemoteDispatch
 
         /// A junction already promised to another live route, which needs it set
         /// a different way, cannot be resolved by waiting.
-        private static string? FirstConflict(TrainRoute route)
+        /// How far along the road this route may be allocated before it would
+        /// take a junction another route is holding the other way.
+        ///
+        /// A crossing road is not a reason to refuse the whole route. The train
+        /// is given everything up to the contested turnout and stands at the
+        /// signal protecting it; when the route in front releases that junction,
+        /// the next tick takes the rest and the signal clears. That is how two
+        /// trains share a crossing, rather than the second waiting for the first
+        /// to finish its entire journey.
+        private static int ConflictLimit(TrainRoute route, out string heldBy)
         {
-            foreach (var setting in route.settings)
+            heldBy = "";
+            foreach (var setting in route.settings.OrderBy(s => s.pathIndex))
             {
                 if (!reservations.TryGetValue(setting.junction, out var ownerId) || ownerId == route.id)
                     continue;
@@ -684,9 +994,28 @@ namespace DvMod.RemoteDispatch
                     owner.message = "Held for higher-priority departure " + route.id + ".";
                     continue;
                 }
-                return "Junction reserved by route " + ownerId + " for train " + owner.trainsetId + ".";
+                heldBy = "route " + ownerId + " (train " + owner.trainsetId + ")";
+                return setting.pathIndex;
             }
-            return null;
+            return int.MaxValue;
+        }
+
+        /// Take any junction that has become available since the road was laid,
+        /// so a train held short of a crossing moves up as the one in front
+        /// clears instead of waiting for a whole new plan.
+        private static void ExtendAllocation(TrainRoute route)
+        {
+            var limit = ConflictLimit(route, out var heldBy);
+            route.heldShortOf = heldBy;
+            if (limit <= route.allocatedUpTo)
+                return;
+
+            route.allocatedUpTo = limit;
+            foreach (var setting in PendingSettings(route))
+                reservations[setting.junction] = route.id;
+            Apply(route);
+            TryReserveNextSignal(route);
+            Sessions.AddTag("routes");
         }
 
         /// Set every junction that is currently clear; defer the rest.
@@ -711,12 +1040,38 @@ namespace DvMod.RemoteDispatch
             // this used to overwrite it and hide notices entirely.
             var notice = route.notice;
 
+            if (route.hasReverseLeg && !route.onReverseLeg)
+            {
+                route.status = RouteStatus.AwaitingReversal;
+                var past = string.IsNullOrEmpty(route.reversalSignalName)
+                    ? "" : " past signal " + route.reversalSignalName;
+                route.message = notice + "Draw forward" + past + " onto "
+                    + route.reversalTrackId + " (about "
+                    + Mathf.RoundToInt(route.runOutMeters) + " m) and stop clear of the"
+                    + " junction, then reverse. The rest of the road is set once you"
+                    + " are clear."
+                    + (route.pending.Count > 0
+                        ? " Waiting for " + route.pending.Count + " occupied junction(s)."
+                        : "");
+                return;
+            }
+
             route.status = route.pending.Count > 0 || route.waitingForSignal
                 ? RouteStatus.Pending : RouteStatus.Active;
             var divergences = route.leftDivergences + route.rightDivergences > 0
                 ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
                 : "";
             var prefix = notice + (route.requiresReverse ? "Route set, train propels (cars lead). " : "");
+            if (route.allocatedUpTo != int.MaxValue && !string.IsNullOrEmpty(route.heldShortOf))
+            {
+                // Set as far as it can go. The train runs up to the signal
+                // protecting the crossing and waits there rather than being
+                // refused the whole road.
+                route.status = RouteStatus.Pending;
+                route.message = prefix + "Road set as far as the crossing, held short of "
+                    + route.heldShortOf + ". It will be extended when that route clears.";
+                return;
+            }
             route.message = route.waitingForSignal
                 ? prefix + "Waiting for the protecting signal route to clear."
                 : route.pending.Count > 0
@@ -738,12 +1093,7 @@ namespace DvMod.RemoteDispatch
                 return;
 
             var occupied = new HashSet<RailTrack>();
-            foreach (var position in Occupancy.AllCarPositions())
-            {
-                var trainset = position.car.trainset;
-                if (trainset != null && trainset.id == route.trainsetId)
-                    occupied.Add(position.track);
-            }
+            Occupancy.TracksOccupiedBy(route.trainsetId, occupied);
             if (occupied.Count == 0)
                 return;
 
@@ -889,7 +1239,8 @@ namespace DvMod.RemoteDispatch
             var chosen = new Dictionary<Junction, JunctionSetting>();
             foreach (var setting in route.settings)
             {
-                if (setting.junction == null || setting.pathIndex < route.progressIndex)
+                if (setting.junction == null || setting.pathIndex < route.progressIndex
+                    || setting.pathIndex >= route.allocatedUpTo)
                     continue;
                 if (chosen.TryGetValue(setting.junction, out var existing)
                     && existing.pathIndex <= setting.pathIndex)
@@ -989,6 +1340,10 @@ namespace DvMod.RemoteDispatch
             while (true)
             {
                 yield return wait;
+                // A client holds no roads of its own; the host allocates for
+                // everyone and sends the result.
+                if (!RouteNetwork.IsAuthority)
+                    continue;
                 foreach (var route in routes.Values.ToList())
                 {
                     if (route.status == RouteStatus.Failed || route.status == RouteStatus.Cleared)
@@ -1000,9 +1355,29 @@ namespace DvMod.RemoteDispatch
                             continue;
                         Sessions.AddTag("routes");
                     }
+                    // A train working towards a reversal is travelling the way
+                    // it was told to; the direction check would read the coming
+                    // change of ends as running the wrong way and re-lay the
+                    // road out from under it.
+                    if (route.hasReverseLeg && !route.onReverseLeg)
+                    {
+                        if (ConsistClearOfReversal(route))
+                        {
+                            BeginReverseLeg(route);
+                            Sessions.AddTag("routes");
+                            continue;
+                        }
+                        UpdateStatus(route);
+                        continue;
+                    }
+
                     VerifyDirection(route);
                     if (!routes.ContainsKey(route.id))
                         continue;   // re-laid during verification
+                    // Held short of another train's road: take whatever it has
+                    // released since the last tick.
+                    if (route.allocationApplied && route.allocatedUpTo != int.MaxValue)
+                        ExtendAllocation(route);
                     UpdateProgress(route);
                     if (!routes.ContainsKey(route.id))
                         continue;   // arrived or rerouted during the update
@@ -1039,6 +1414,11 @@ namespace DvMod.RemoteDispatch
                     if (cleared)
                         Sessions.AddTag("routes");
                 }
+
+                // Roads move on their own as trains clear crossings, so this is
+                // driven by the list actually changing rather than by any one
+                // place that edits it.
+                PublishRoutes();
             }
         }
 
@@ -1164,6 +1544,14 @@ namespace DvMod.RemoteDispatch
             new JProperty("priority", route.priority),
             new JProperty("pendingJunctions", route.pending.Count),
             new JProperty("requiresReverse", route.requiresReverse),
+            new JProperty("hasReverseLeg", route.hasReverseLeg),
+            new JProperty("onReverseLeg", route.onReverseLeg),
+            new JProperty("reversalTrack", route.reversalTrackId),
+            new JProperty("reversalSignal", route.reversalSignalName),
+            new JProperty("heldShortOf", route.heldShortOf),
+            new JProperty("requestedBy", route.requestedBy),
+            new JProperty("sequence", route.sequence),
+            new JProperty("colorIndex", route.colorIndex),
             new JProperty("leftDivergences", route.leftDivergences),
             new JProperty("rightDivergences", route.rightDivergences),
             new JProperty("distanceMeters", System.Math.Round(route.distanceMeters, 1)),
@@ -1171,7 +1559,49 @@ namespace DvMod.RemoteDispatch
             new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
             new JProperty("passedTracks", route.progressIndex));
 
+        /// The route list as the page consumes it.
+        ///
+        /// On a client this is the host's list, not the local table: a client
+        /// holds no roads of its own, so anything built from `routes` there
+        /// would be empty. Both the first fetch and the live update stream come
+        /// through here, because serving the host's list to one and the empty
+        /// local table to the other showed the routes and then wiped them.
+        public static JArray AllRoutesToken()
+        {
+            if (!RouteNetwork.IsRemoteClient)
+                return new JArray(routes.Values.Select(ToJson));
+            try
+            {
+                return JArray.Parse(RouteNetwork.MirroredRoutesJson);
+            }
+            catch
+            {
+                return new JArray();
+            }
+        }
+
         public static string AllRoutesJson() =>
-            new JArray(routes.Values.Select(ToJson)).ToString(Newtonsoft.Json.Formatting.None);
+            AllRoutesToken().ToString(Newtonsoft.Json.Formatting.None);
+
+        /// Send the route list to the session when it differs from the last one
+        /// sent.
+        ///
+        /// Compared against what actually went out rather than against a
+        /// snapshot taken earlier in the same pass: a road the host set from its
+        /// own page between passes is already present by the time a per-pass
+        /// snapshot is taken, so nothing would look changed and it would never
+        /// be sent.
+        public static void PublishRoutes()
+        {
+            if (!RouteNetwork.Present || !RouteNetwork.IsAuthority)
+                return;
+            var current = AllRoutesJson();
+            if (current == lastPublishedJson)
+                return;
+            lastPublishedJson = current;
+            RouteNetwork.BroadcastRoutes(current);
+        }
+
+        private static string lastPublishedJson = "";
     }
 }

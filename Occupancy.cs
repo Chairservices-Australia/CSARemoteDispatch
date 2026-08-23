@@ -5,15 +5,39 @@ using UnityEngine;
 namespace DvMod.RemoteDispatch
 {
     /// Where every car currently is, for switch safety and block detection.
+    ///
+    /// Both questions are asked far more often than cars actually move - the
+    /// signalling postfix runs against every signal DV Signals refreshes - so
+    /// the answers come from an index rebuilt on demand and shared by every
+    /// caller within a frame, rather than by walking the world each time.
     public static class Occupancy
     {
         /// A junction with a bogie this close is treated as occupied. Throwing a
         /// switch under a car derails it, so this is deliberately generous.
         public const float JunctionClearanceMeters = 20f;
 
+        /// How stale an index a display may be drawn from. Callers deciding
+        /// whether a switch is safe to throw ask for one built this frame.
+        private const float DisplayMaxAgeSeconds = 0.25f;
+
+        /// Wider than the clearance, so the eight neighbouring cells bound any
+        /// junction search.
+        private const float GridCellMeters = 25f;
+
         private static readonly Dictionary<RailTrack, HashSet<TrainCar>> carsByTrack =
             new Dictionary<RailTrack, HashSet<TrainCar>>();
-        private static int carIndexFrame = -1;
+        private static readonly Dictionary<Vector2Int, List<CarPosition>> carGrid =
+            new Dictionary<Vector2Int, List<CarPosition>>();
+
+        // Rebuilding happens often enough that dropping its collections each
+        // time is itself a cost; they are recycled rather than reallocated.
+        private static readonly Stack<HashSet<TrainCar>> carSetPool =
+            new Stack<HashSet<TrainCar>>();
+        private static readonly Stack<List<CarPosition>> positionListPool =
+            new Stack<List<CarPosition>>();
+
+        private static int indexFrame = -1;
+        private static float indexTime = float.NegativeInfinity;
 
         public readonly struct CarPosition
         {
@@ -27,6 +51,15 @@ namespace DvMod.RemoteDispatch
                 this.track = track;
                 this.position = position;
             }
+        }
+
+        public static void Reset()
+        {
+            Recycle();
+            carSetPool.Clear();
+            positionListPool.Clear();
+            indexFrame = -1;
+            indexTime = float.NegativeInfinity;
         }
 
         public static IEnumerable<CarPosition> AllCarPositions()
@@ -67,6 +100,32 @@ namespace DvMod.RemoteDispatch
             return result;
         }
 
+        /// The tracks a single consist stands on.
+        ///
+        /// Walks that consist rather than every car in the world: a route only
+        /// ever asks about its own train, and the world may hold hundreds of
+        /// cars belonging to other ones.
+        public static void TracksOccupiedBy(Trainset? trainset, HashSet<RailTrack> into)
+        {
+            into.Clear();
+            var cars = trainset?.cars;
+            if (cars == null)
+                return;
+            foreach (var car in cars)
+            {
+                if (car == null || car.Bogies == null)
+                    continue;
+                foreach (var bogie in car.Bogies)
+                {
+                    if (bogie != null && bogie.track != null)
+                        into.Add(bogie.track);
+                }
+            }
+        }
+
+        public static void TracksOccupiedBy(int trainsetId, HashSet<RailTrack> into) =>
+            TracksOccupiedBy(Trainset.allSets?.Find(set => set != null && set.id == trainsetId), into);
+
         /// True when no car sits close enough to the junction that throwing it
         /// would derail something. `ignoreTrainsetId` excludes the train being
         /// routed, which may legitimately be standing on its own switch.
@@ -74,15 +133,30 @@ namespace DvMod.RemoteDispatch
         {
             if (junction == null)
                 return false;
+
+            // Switch safety: never decide from an index built on an earlier
+            // frame, however recently.
+            EnsureIndex(0f);
+
             var junctionPosition = junction.position;
-            foreach (var position in AllCarPositions())
+            var center = GridCell(junctionPosition);
+            for (var x = center.x - 1; x <= center.x + 1; x++)
             {
-                if (ignoreTrainsetId >= 0
-                    && position.car.trainset != null
-                    && position.car.trainset.id == ignoreTrainsetId)
-                    continue;
-                if (Vector3.Distance(position.position, junctionPosition) <= JunctionClearanceMeters)
-                    return false;
+                for (var y = center.y - 1; y <= center.y + 1; y++)
+                {
+                    if (!carGrid.TryGetValue(new Vector2Int(x, y), out var bucket))
+                        continue;
+                    for (var i = 0; i < bucket.Count; i++)
+                    {
+                        var position = bucket[i];
+                        if (ignoreTrainsetId >= 0
+                            && position.car.trainset != null
+                            && position.car.trainset.id == ignoreTrainsetId)
+                            continue;
+                        if (Vector3.Distance(position.position, junctionPosition) <= JunctionClearanceMeters)
+                            return false;
+                    }
+                }
             }
             return true;
         }
@@ -107,13 +181,20 @@ namespace DvMod.RemoteDispatch
         /// True when the selected tracks contain another consist but none of
         /// its occupying vehicles is a locomotive. Used for a permissive
         /// coupling indication without weakening protection against trains.
+        ///
+        /// Takes a list rather than a sequence: this runs once per signal per
+        /// refresh, often enough that an enumerator per call shows up.
         public static bool ContainsOnlyUnpoweredCars(
-            IEnumerable<RailTrack> tracks, int ignoreTrainsetId = -1)
+            List<RailTrack> tracks, int ignoreTrainsetId = -1)
         {
-            RefreshCarIndex();
+            // Only an indication is drawn from this, so a recent index is good
+            // enough and keeps the scan off most frames entirely.
+            EnsureIndex(DisplayMaxAgeSeconds);
+
             var foundCar = false;
-            foreach (var track in tracks)
+            for (var i = 0; i < tracks.Count; i++)
             {
+                var track = tracks[i];
                 if (track == null || !carsByTrack.TryGetValue(track, out var cars))
                     continue;
                 foreach (var car in cars)
@@ -129,18 +210,82 @@ namespace DvMod.RemoteDispatch
             return foundCar;
         }
 
-        private static void RefreshCarIndex()
+        /// Rebuild the index unless one already answers to the requested
+        /// freshness. An index built this frame always does.
+        private static void EnsureIndex(float maxAgeSeconds)
         {
-            if (carIndexFrame == Time.frameCount)
+            if (indexFrame == Time.frameCount)
                 return;
-            carIndexFrame = Time.frameCount;
-            carsByTrack.Clear();
-            foreach (var position in AllCarPositions())
+            if (maxAgeSeconds > 0f && Time.time - indexTime < maxAgeSeconds)
+                return;
+            Rebuild();
+        }
+
+        private static void Rebuild()
+        {
+            indexFrame = Time.frameCount;
+            indexTime = Time.time;
+            Recycle();
+
+            var sets = Trainset.allSets;
+            if (sets == null)
+                return;
+
+            // Deliberately not written over AllCarPositions: this is the one
+            // caller hot enough that the iterator itself is worth avoiding.
+            foreach (var set in sets)
             {
-                if (!carsByTrack.TryGetValue(position.track, out var cars))
-                    carsByTrack[position.track] = cars = new HashSet<TrainCar>();
-                cars.Add(position.car);
+                if (set == null || set.cars == null)
+                    continue;
+                foreach (var car in set.cars)
+                {
+                    if (car == null || car.Bogies == null)
+                        continue;
+                    foreach (var bogie in car.Bogies)
+                    {
+                        if (bogie == null || bogie.track == null || bogie.traveller == null)
+                            continue;
+                        var p = bogie.traveller.worldPosition;
+                        var position = new Vector3((float)p.x, (float)p.y, (float)p.z);
+
+                        if (!carsByTrack.TryGetValue(bogie.track, out var cars))
+                            carsByTrack[bogie.track] = cars = RentSet();
+                        cars.Add(car);
+
+                        var cell = GridCell(position);
+                        if (!carGrid.TryGetValue(cell, out var bucket))
+                            carGrid[cell] = bucket = RentList();
+                        bucket.Add(new CarPosition(car, bogie.track, position));
+                    }
+                }
             }
         }
+
+        private static void Recycle()
+        {
+            foreach (var cars in carsByTrack.Values)
+            {
+                cars.Clear();
+                carSetPool.Push(cars);
+            }
+            carsByTrack.Clear();
+
+            foreach (var bucket in carGrid.Values)
+            {
+                bucket.Clear();
+                positionListPool.Push(bucket);
+            }
+            carGrid.Clear();
+        }
+
+        private static HashSet<TrainCar> RentSet() =>
+            carSetPool.Count > 0 ? carSetPool.Pop() : new HashSet<TrainCar>();
+
+        private static List<CarPosition> RentList() =>
+            positionListPool.Count > 0 ? positionListPool.Pop() : new List<CarPosition>();
+
+        private static Vector2Int GridCell(Vector3 position) => new Vector2Int(
+            Mathf.FloorToInt(position.x / GridCellMeters),
+            Mathf.FloorToInt(position.z / GridCellMeters));
     }
 }

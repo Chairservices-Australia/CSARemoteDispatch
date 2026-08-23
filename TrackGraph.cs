@@ -41,7 +41,11 @@ namespace DvMod.RemoteDispatch
             return curve == null ? 1f : Mathf.Max(1f, curve.length);
         }
 
-        private static Vector3 EndPosition(Step step)
+        /// The same track travelled the other way, which is the state a train
+        /// enters when it stops and changes ends.
+        public static Step Flip(Step step) => new Step(step.track, !step.enteredViaIn);
+
+        public static Vector3 EndPosition(Step step)
         {
             var junction = step.ExitJunction;
             if (junction != null)
@@ -170,6 +174,101 @@ namespace DvMod.RemoteDispatch
                 }
             }
             return seen.Count;
+        }
+
+        /// Everything within reach of a starting state, and how it was reached.
+        ///
+        /// Dijkstra rather than A*: there is no single goal here. This answers
+        /// "where could this train get to, and how far is it" for the whole
+        /// neighbourhood at once, which is what choosing a place to reverse
+        /// needs.
+        public sealed class Exploration
+        {
+            public Step start;
+            public readonly Dictionary<Step, float> cost = new Dictionary<Step, float>();
+            public readonly Dictionary<Step, Step> cameFrom = new Dictionary<Step, Step>();
+
+            public List<Step> PathTo(Step step) => Reconstruct(cameFrom, start, step);
+        }
+
+        public static Exploration Explore(
+            Step start,
+            float maxDistance,
+            Func<Step, Step, float>? extraCost = null,
+            int maxExpansions = 20000)
+        {
+            var result = new Exploration { start = start };
+            result.cost[start] = TrackLength(start.track);
+
+            var open = new SortedSet<(float priority, int tie, Step step)>(
+                Comparer<(float priority, int tie, Step step)>.Create((a, b) =>
+                    a.priority != b.priority ? a.priority.CompareTo(b.priority) : a.tie.CompareTo(b.tie)));
+            var tieBreaker = 0;
+            open.Add((result.cost[start], tieBreaker++, start));
+
+            var expansions = 0;
+            while (open.Count > 0 && expansions++ < maxExpansions)
+            {
+                var current = open.Min;
+                open.Remove(current);
+                var step = current.step;
+                var soFar = result.cost[step];
+                if (soFar > maxDistance)
+                    continue;
+
+                foreach (var next in Successors(step))
+                {
+                    var penalty = extraCost == null ? 0f : extraCost(step, next);
+                    if (float.IsPositiveInfinity(penalty))
+                        continue;
+                    var newCost = soFar + TrackLength(next.track) + penalty;
+                    if (newCost > maxDistance)
+                        continue;
+                    if (result.cost.TryGetValue(next, out var existing) && newCost >= existing)
+                        continue;
+                    result.cost[next] = newCost;
+                    result.cameFrom[next] = step;
+                    open.Add((newCost, tieBreaker++, next));
+                }
+            }
+            return result;
+        }
+
+        /// Every state from which one of `goals` can still be reached.
+        ///
+        /// Running the graph is symmetric - a train can always draw back the way
+        /// it came - so "can I get to the goal from here" is the same question
+        /// as "is my reverse reachable from the goal's reverse". One sweep out
+        /// of the destination therefore answers it for the whole network, which
+        /// is what makes it affordable to test thousands of candidate reversal
+        /// points before searching from any of them.
+        ///
+        /// Test membership with the flipped state: `reaching.Contains(Flip(s))`.
+        public static HashSet<Step> StatesReaching(HashSet<RailTrack> goals, int limit = 200000)
+        {
+            var seen = new HashSet<Step>();
+            var queue = new Queue<Step>();
+            foreach (var goal in goals)
+            {
+                if (goal == null)
+                    continue;
+                foreach (var direction in new[] { true, false })
+                {
+                    var step = new Step(goal, direction);
+                    if (seen.Add(step))
+                        queue.Enqueue(step);
+                }
+            }
+
+            while (queue.Count > 0 && seen.Count < limit)
+            {
+                foreach (var next in Successors(queue.Dequeue()))
+                {
+                    if (seen.Add(next))
+                        queue.Enqueue(next);
+                }
+            }
+            return seen;
         }
 
         private static List<Step> Reconstruct(Dictionary<Step, Step> cameFrom, Step start, Step goal)

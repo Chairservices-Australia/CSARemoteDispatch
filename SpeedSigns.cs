@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -36,9 +37,42 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        /// Signs stream in and out with the world, so they are accumulated as
-        /// they are seen rather than scanned once, keyed by rounded position so
-        /// the same sign is not stored twice.
+        /// Identity of a sign: where it stands, to the metre, plus which entry
+        /// on the pole it is.
+        ///
+        /// Keyed by position rather than by the component carrying it, because
+        /// the world streams signs out and back in and the same physical sign
+        /// must not register twice. The index separates the stacked limits on a
+        /// junction board, which share both a pole and a position.
+        private readonly struct SignKey : IEquatable<SignKey>
+        {
+            private readonly int x;
+            private readonly int y;
+            private readonly int z;
+            private readonly int index;
+
+            public SignKey(Vector3 position, int index)
+            {
+                x = Mathf.RoundToInt(position.x);
+                y = Mathf.RoundToInt(position.y);
+                z = Mathf.RoundToInt(position.z);
+                this.index = index;
+            }
+
+            public bool Equals(SignKey other) =>
+                x == other.x && y == other.y && z == other.z && index == other.index;
+
+            public override bool Equals(object? obj) => obj is SignKey other && Equals(other);
+
+            public override int GetHashCode()
+            {
+                var hash = x;
+                hash = (hash * 397) ^ y;
+                hash = (hash * 397) ^ z;
+                return (hash * 397) ^ index;
+            }
+        }
+
         private sealed class TrainState
         {
             public TrainCar leadCar = null!;
@@ -47,77 +81,177 @@ namespace DvMod.RemoteDispatch
             public int limit;
         }
 
-        private static readonly Dictionary<string, Sign> known = new Dictionary<string, Sign>();
+        /// Signs stream in and out with the world, so they are accumulated as
+        /// they are seen rather than scanned once.
+        private static readonly Dictionary<SignKey, Sign> known = new Dictionary<SignKey, Sign>();
+
+        /// The same signs indexed by the track they belong to. A limit is only
+        /// ever looked up for the track a train is on, and the flat collection
+        /// grows for as long as the session lasts, so it must not be the thing
+        /// that gets searched.
+        private static readonly Dictionary<RailTrack, List<Sign>> signsByTrack =
+            new Dictionary<RailTrack, List<Sign>>();
+
+        /// Signs no track in the current grid is near enough to claim. Held so
+        /// a pass does not keep paying to re-project them; cleared whenever the
+        /// grid is rebuilt, which is the only thing that can change the answer.
+        private static readonly HashSet<SignKey> unplaceable = new HashSet<SignKey>();
+
         private static readonly Dictionary<int, TrainState> trainStates = new Dictionary<int, TrainState>();
         private static readonly Dictionary<Vector2Int, List<RailTrack>> trackGrid =
             new Dictionary<Vector2Int, List<RailTrack>>();
-        private static float nextScanTime;
-        private static float nextTrackGridTime;
 
-        public const float RescanSeconds = 5f;
+        private static Vector3 lastScanPosition;
+        private static bool scannedOnce;
+        private static float nextForcedScanTime;
+        private static float nextTrackGridRebuildTime;
+        private static int unmatchedSinceGridBuild;
 
         public static int KnownCount => known.Count;
 
         public static void Reset()
         {
             known.Clear();
+            signsByTrack.Clear();
+            unplaceable.Clear();
             trainStates.Clear();
             trackGrid.Clear();
-            nextScanTime = 0f;
-            nextTrackGridTime = 0f;
+            lastScanPosition = Vector3.zero;
+            scannedOnce = false;
+            nextForcedScanTime = 0f;
+            nextTrackGridRebuildTime = 0f;
+            unmatchedSinceGridBuild = 0;
         }
 
-        public static void ScanIfDue()
+        /// Sign discovery, spread across frames and paced by how far the player
+        /// has actually travelled.
+        ///
+        /// Signs are baked into the world and stream in with it, and the game
+        /// offers no hook for their arrival, so they still have to be looked
+        /// for. Doing that on a fixed timer meant a world-wide scan every few
+        /// seconds whether or not anything had changed, which is felt as a
+        /// regular hitch. This waits until there is new ground to cover, then
+        /// works through the results a slice at a time so no single frame
+        /// carries the whole pass.
+        public static IEnumerator DiscoveryCoroutine()
         {
-            if (Time.time < nextScanTime)
-                return;
-            nextScanTime = Time.time + RescanSeconds;
-            Scan();
-        }
+            var poll = WaitFor.Seconds(PollSeconds);
+            while (true)
+            {
+                yield return poll;
 
-        public static void Scan()
-        {
-            if (trackGrid.Count == 0 || Time.time >= nextTrackGridTime)
-            {
-                BuildTrackGrid(UnityEngine.Object.FindObjectsOfType<RailTrack>());
-                nextTrackGridTime = Time.time + TrackGridRefreshSeconds;
-            }
-            foreach (var data in UnityEngine.Object.FindObjectsOfType<SignGeneratorData>())
-            {
-                if (data == null || data.signParameters == null)
+                if (!TryGetScanOrigin(out var origin) || !IsScanDue(origin))
                     continue;
-                for (var i = 0; i < data.signParameters.Length; i++)
-                {
-                    var parameters = data.signParameters[i];
-                    if (!IsSpeedLimit(parameters.type))
-                        continue;
-                    if (!TryParseSpeed(parameters.signText, out var kph))
-                        continue;
 
-                    var transform = data.transform;
-                    var position = transform.position;
-                    // Junction boards are generated as speed, arrow, speed,
-                    // arrow on one pole. Key by component and parameter index so
-                    // both limits survive instead of the first one hiding the
-                    // second merely because they share a world position.
-                    var key = data.GetInstanceID() + ":" + i;
-                    if (known.ContainsKey(key))
-                        continue;
-                    if (!NearestTrack(position, transform.forward, NearbyTracks(position),
-                        out var track, out var trackPosition))
-                        continue;
-                    bool? arrowLeft = null;
-                    if (i + 1 < data.signParameters.Length)
+                scannedOnce = true;
+                lastScanPosition = origin;
+                nextForcedScanTime = Time.time + ForcedRescanSeconds;
+
+                // The rail network is effectively static, so the grid is built
+                // once. It is only reconsidered when a pass found signs that no
+                // known track could claim, which is what a newly streamed-in
+                // piece of railway would look like.
+                if (trackGrid.Count == 0
+                    || (unmatchedSinceGridBuild > 0 && Time.time >= nextTrackGridRebuildTime))
+                {
+                    var tracks = UnityEngine.Object.FindObjectsOfType<RailTrack>();
+                    trackGrid.Clear();
+                    unplaceable.Clear();
+                    unmatchedSinceGridBuild = 0;
+                    nextTrackGridRebuildTime = Time.time + TrackGridMinRebuildSeconds;
+                    for (var i = 0; i < tracks.Length; i++)
                     {
-                        var nextType = data.signParameters[i + 1].type;
-                        if (nextType == SignType.ArrowLeft)
-                            arrowLeft = true;
-                        else if (nextType == SignType.ArrowRight)
-                            arrowLeft = false;
+                        AddTrackToGrid(tracks[i]);
+                        if ((i + 1) % TracksPerFrame == 0)
+                            yield return null;
                     }
-                    known[key] = new Sign(position, transform.forward, kph, track,
-                        trackPosition, arrowLeft);
                 }
+
+                var data = UnityEngine.Object.FindObjectsOfType<SignGeneratorData>();
+                for (var i = 0; i < data.Length; i++)
+                {
+                    RegisterSigns(data[i]);
+                    if ((i + 1) % SignComponentsPerFrame == 0)
+                        yield return null;
+                }
+            }
+        }
+
+        private static bool IsScanDue(Vector3 origin)
+        {
+            if (!scannedOnce)
+                return true;
+            if (Time.time >= nextForcedScanTime)
+                return true;
+            return (origin - lastScanPosition).sqrMagnitude
+                > RescanDistanceMeters * RescanDistanceMeters;
+        }
+
+        private static bool TryGetScanOrigin(out Vector3 origin)
+        {
+            var car = PlayerManager.Car;
+            if (car != null)
+            {
+                origin = car.transform.position;
+                return true;
+            }
+            var player = PlayerManager.PlayerTransform;
+            if (player != null)
+            {
+                origin = player.position;
+                return true;
+            }
+            origin = Vector3.zero;
+            return false;
+        }
+
+        private static void RegisterSigns(SignGeneratorData data)
+        {
+            if (data == null || data.signParameters == null)
+                return;
+
+            var transform = data.transform;
+            var position = transform.position;
+            var facing = transform.forward;
+
+            for (var i = 0; i < data.signParameters.Length; i++)
+            {
+                var parameters = data.signParameters[i];
+                if (!IsSpeedLimit(parameters.type))
+                    continue;
+                if (!TryParseSpeed(parameters.signText, out var kph))
+                    continue;
+
+                var key = new SignKey(position, i);
+                if (known.ContainsKey(key) || unplaceable.Contains(key))
+                    continue;
+
+                if (!NearestTrack(position, facing, NearbyTracks(position),
+                    out var track, out var trackPosition))
+                {
+                    unplaceable.Add(key);
+                    unmatchedSinceGridBuild++;
+                    continue;
+                }
+
+                // Junction boards are generated as speed, arrow, speed, arrow
+                // on one pole, so the arrow that qualifies a limit is the entry
+                // after it.
+                bool? arrowLeft = null;
+                if (i + 1 < data.signParameters.Length)
+                {
+                    var nextType = data.signParameters[i + 1].type;
+                    if (nextType == SignType.ArrowLeft)
+                        arrowLeft = true;
+                    else if (nextType == SignType.ArrowRight)
+                        arrowLeft = false;
+                }
+
+                var sign = new Sign(position, facing, kph, track, trackPosition, arrowLeft);
+                known[key] = sign;
+                if (!signsByTrack.TryGetValue(track, out var onTrack))
+                    signsByTrack[track] = onTrack = new List<Sign>();
+                onTrack.Add(sign);
             }
         }
 
@@ -199,27 +333,31 @@ namespace DvMod.RemoteDispatch
                 return state.limit;
 
             Sign? lastCrossed = null;
-            foreach (var sign in known.Values)
+            if (signsByTrack.TryGetValue(bogie.track, out var signs))
             {
-                if (sign.track != bogie.track || !FacesTrain(sign, flatHeading))
-                    continue;
+                for (var i = 0; i < signs.Count; i++)
+                {
+                    var sign = signs[i];
+                    if (!FacesTrain(sign, flatHeading))
+                        continue;
 
-                var crossed = movement > 0f
-                    ? sign.trackPosition > state.trackPosition + CrossingToleranceMeters
-                        && sign.trackPosition <= trainPosition + CrossingToleranceMeters
-                    : sign.trackPosition < state.trackPosition - CrossingToleranceMeters
-                        && sign.trackPosition >= trainPosition - CrossingToleranceMeters;
-                if (!crossed)
-                    continue;
-                if (!AppliesToSelectedBranch(sign, movement > 0f))
-                    continue;
+                    var crossed = movement > 0f
+                        ? sign.trackPosition > state.trackPosition + CrossingToleranceMeters
+                            && sign.trackPosition <= trainPosition + CrossingToleranceMeters
+                        : sign.trackPosition < state.trackPosition - CrossingToleranceMeters
+                            && sign.trackPosition >= trainPosition - CrossingToleranceMeters;
+                    if (!crossed)
+                        continue;
+                    if (!AppliesToSelectedBranch(sign, movement > 0f))
+                        continue;
 
-                // If more than one sign was crossed between UI updates, the last
-                // one in the direction of travel defines the new block.
-                if (!lastCrossed.HasValue
-                    || (movement > 0f && sign.trackPosition > lastCrossed.Value.trackPosition)
-                    || (movement < 0f && sign.trackPosition < lastCrossed.Value.trackPosition))
-                    lastCrossed = sign;
+                    // If more than one sign was crossed between UI updates, the
+                    // last one in the direction of travel defines the new block.
+                    if (!lastCrossed.HasValue
+                        || (movement > 0f && sign.trackPosition > lastCrossed.Value.trackPosition)
+                        || (movement < 0f && sign.trackPosition < lastCrossed.Value.trackPosition))
+                        lastCrossed = sign;
+                }
             }
 
             state.trackPosition = trainPosition;
@@ -230,12 +368,16 @@ namespace DvMod.RemoteDispatch
 
         private static int? InitialLimit(RailTrack track, float trainPosition, Vector3 heading)
         {
+            if (!signsByTrack.TryGetValue(track, out var signs))
+                return null;
+
             var increasing = TrackDirectionAt(track, trainPosition, heading);
             var nearestPassed = float.MaxValue;
             int? result = null;
-            foreach (var sign in known.Values)
+            for (var i = 0; i < signs.Count; i++)
             {
-                if (sign.track != track || !FacesTrain(sign, heading))
+                var sign = signs[i];
+                if (!FacesTrain(sign, heading))
                     continue;
                 if (!AppliesToSelectedBranch(sign, increasing))
                     continue;
@@ -278,30 +420,46 @@ namespace DvMod.RemoteDispatch
         private const float TrackAssignmentMeters = 6f;
         private const float TrackGridCellMeters = 50f;
         private const float TrackGridSampleMeters = 25f;
-        private const float TrackGridRefreshSeconds = 30f;
         private const float MinimumMovementMeters = 0.05f;
         private const float CrossingToleranceMeters = 0.1f;
         private const int CurveSamples = 32;
 
-        private static void BuildTrackGrid(IEnumerable<RailTrack> tracks)
+        /// How often the coroutine looks at whether a pass is warranted. Cheap:
+        /// it only compares the player's position against the last one scanned.
+        private const float PollSeconds = 1f;
+
+        /// New ground that has to be covered before signs are looked for again.
+        private const float RescanDistanceMeters = 150f;
+
+        /// A floor, so a player who never moves far still picks up signs that
+        /// streamed in around them.
+        private const float ForcedRescanSeconds = 60f;
+
+        /// The soonest the track grid may be built a second time, however many
+        /// signs go unplaced in the meantime.
+        private const float TrackGridMinRebuildSeconds = 120f;
+
+        // Work carried by a single frame during a pass.
+        private const int TracksPerFrame = 96;
+        private const int SignComponentsPerFrame = 192;
+
+        private static void AddTrackToGrid(RailTrack track)
         {
-            trackGrid.Clear();
-            foreach (var track in tracks)
+            var curve = track == null ? null : track.curve;
+            if (curve == null || curve.pointCount < 2)
+                return;
+            var samples = Mathf.Max(1,
+                Mathf.CeilToInt(TrackGraph.TrackLength(track!) / TrackGridSampleMeters));
+            for (var i = 0; i <= samples; i++)
             {
-                var curve = track == null ? null : track.curve;
-                if (curve == null || curve.pointCount < 2)
-                    continue;
-                var samples = Mathf.Max(1,
-                    Mathf.CeilToInt(TrackGraph.TrackLength(track!) / TrackGridSampleMeters));
-                var cells = new HashSet<Vector2Int>();
-                for (var i = 0; i <= samples; i++)
-                    cells.Add(GridCell(curve.GetPointAt((float)i / samples)));
-                foreach (var cell in cells)
-                {
-                    if (!trackGrid.TryGetValue(cell, out var bucket))
-                        trackGrid[cell] = bucket = new List<RailTrack>();
+                var cell = GridCell(curve.GetPointAt((float)i / samples));
+                if (!trackGrid.TryGetValue(cell, out var bucket))
+                    trackGrid[cell] = bucket = new List<RailTrack>();
+                // Consecutive samples land in the same cell far more often than
+                // not, so checking the last entry removes nearly all repeats
+                // without a set per track.
+                if (bucket.Count == 0 || bucket[bucket.Count - 1] != track)
                     bucket.Add(track!);
-                }
             }
         }
 

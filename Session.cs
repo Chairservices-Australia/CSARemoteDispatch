@@ -116,7 +116,7 @@ namespace DvMod.RemoteDispatch
                 "jobs" => JObject.FromObject(JobData.GetAllJobData()),
                 "junctions" => new JArray(Junctions.GetAllJunctionStates()),
                 "player" => PlayerData.GetPlayerData(),
-                "routes" => new JArray(Routing.AllRoutes().Select(Routing.ToJson)),
+                "routes" => Routing.AllRoutesToken(),
                 _ when tag.Contains('-') => GetUpdateForSplitTag(tag),
                 _ => throw new NotImplementedException($"Unexpected update tag {tag}"),
             };
