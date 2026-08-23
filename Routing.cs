@@ -327,7 +327,7 @@ namespace DvMod.RemoteDispatch
                 if (found == null)
                     continue;
                 var length = PathLength(found);
-                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters;
+                var routeCost = length + CountParallelRightHandChoices(found) * RightHandCostMeters;
                 if (path == null || routeCost < bestRouteCost
                     || (Mathf.Approximately(routeCost, bestRouteCost) && length < shortestLength))
                 {
@@ -499,14 +499,13 @@ namespace DvMod.RemoteDispatch
             route.allocationApplied = false;
         }
 
-        /// A modest distance-equivalent cost for taking the right-hand road at
-        /// a facing junction. This resolves parallel and near-equal alternatives
-        /// to the left, while an actually shorter road still wins once it saves
-        /// more than this amount per right-hand divergence.
+        /// A modest distance-equivalent cost for taking the right-hand member of
+        /// a parallel pair. Ordinary branches receive no penalty, so this cannot
+        /// pull a route away from its shortest useful alignment through a yard.
         private const float RightHandCostMeters = 25f;
 
         private static float LeftHandRunningPenalty(TrackGraph.Step from, TrackGraph.Step to) =>
-            IsRightHandChoice(from, to) ? RightHandCostMeters : 0f;
+            IsParallelRightHandChoice(from, to) ? RightHandCostMeters : 0f;
 
         /// Reports whether a path takes the right-hand option relative to its
         /// actual direction of travel.
@@ -528,12 +527,56 @@ namespace DvMod.RemoteDispatch
             return chosenOffset < leftmostOffset - BranchSideToleranceMeters;
         }
 
-        private static int CountRightHandChoices(List<TrackGraph.Step> path)
+        /// True only when the selected right-hand road and the leftmost option
+        /// are already running in effectively the same direction. A normal
+        /// turnout or station throat is therefore decided solely by distance.
+        private static bool IsParallelRightHandChoice(TrackGraph.Step from, TrackGraph.Step to)
+        {
+            if (!IsRightHandChoice(from, to) || !IsFacingChoice(from, out var junction))
+                return false;
+
+            var position = junction!.position;
+            var approach = ApproachAtJunction(from);
+            var chosenOffset = LateralOffset(position, approach, to.track, to.enteredViaIn);
+            var leftmostOffset = float.MinValue;
+            var leftmostHeading = Vector3.zero;
+
+            foreach (var branch in junction.outBranches)
+            {
+                if (branch == null || branch.track == null)
+                    continue;
+                var offset = LateralOffset(position, approach, branch.track, branch.first);
+                if (offset <= leftmostOffset)
+                    continue;
+                leftmostOffset = offset;
+                leftmostHeading = BranchHeading(branch.track, branch.first);
+            }
+
+            var chosenHeading = BranchHeading(to.track, to.enteredViaIn);
+            if (chosenHeading.sqrMagnitude < 0.0001f || leftmostHeading.sqrMagnitude < 0.0001f)
+                return false;
+
+            const float minimumParallelSeparationMeters = 1.5f;
+            const float cosThreeDegrees = 0.9986295f;
+            return leftmostOffset - chosenOffset >= minimumParallelSeparationMeters
+                && Vector3.Dot(chosenHeading.normalized, leftmostHeading.normalized) >= cosThreeDegrees;
+        }
+
+        private static Vector3 BranchHeading(RailTrack track, bool fromInEnd)
+        {
+            var near = PointAlong(track, fromInEnd, BranchSampleMeters * 0.5f);
+            var far = PointAlong(track, fromInEnd, BranchSampleMeters);
+            var heading = far - near;
+            heading.y = 0f;
+            return heading;
+        }
+
+        private static int CountParallelRightHandChoices(List<TrackGraph.Step> path)
         {
             var count = 0;
             for (var i = 0; i + 1 < path.Count; i++)
             {
-                if (IsRightHandChoice(path[i], path[i + 1]))
+                if (IsParallelRightHandChoice(path[i], path[i + 1]))
                     count++;
             }
             return count;
