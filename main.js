@@ -600,6 +600,8 @@ const stationsReady = fetch(new URL('/station', location))
       false);
     updateRouteTrackList();
     refreshRoutes();
+    refreshCurrentTrain();
+    setInterval(refreshCurrentTrain, 2000);
   });
 
 document.getElementById('stationLabelsCheckbox')
@@ -672,7 +674,49 @@ function updateRouteTrackList() {
 
 routeStationSelect.addEventListener('input', updateRouteTrackList);
 
+// Bright green over the booked road, so where a train is going reads at a
+// glance without tracing junctions by eye.
+const routeHighlightColor = '#00e676';
+const highlightedTracks = new Set();
+
+function baseTrackColor(trackId) {
+  // Matches how the track layer is drawn: yard tracks are named, plain line
+  // carries the generic '#' form.
+  return trackId.includes('#') ? 'lightsteelblue' : 'slategray';
+}
+
+function applyRouteHighlight(routes) {
+  const routed = new Set();
+  for (const route of routes) {
+    if (route.status === 'Failed' || route.status === 'Cleared')
+      continue;
+    for (const trackId of route.tracks || [])
+      routed.add(trackId);
+  }
+
+  for (const trackId of highlightedTracks) {
+    if (routed.has(trackId))
+      continue;
+    const polyline = trackPolyLines.get(trackId);
+    if (polyline)
+      polyline.setStyle({ color: baseTrackColor(trackId), weight: 3 });
+  }
+
+  for (const trackId of routed) {
+    const polyline = trackPolyLines.get(trackId);
+    if (!polyline)
+      continue;
+    polyline.setStyle({ color: routeHighlightColor, weight: 5 });
+    polyline.bringToFront();
+  }
+
+  highlightedTracks.clear();
+  for (const trackId of routed)
+    highlightedTracks.add(trackId);
+}
+
 function renderRoutes(routes) {
+  applyRouteHighlight(routes);
   routeListBody.innerHTML = '';
   for (const route of routes) {
     const row = document.createElement('tr');
@@ -701,6 +745,65 @@ function clearRoute(routeId) {
   fetch(new URL(`/route/${routeId}/clear`, location), { method: 'POST', body: '' })
     .then(response => response.json())
     .then(renderRoutes)
+    .catch(() => {});
+}
+
+// Detect the consist the player is riding in and the job it is working, so
+// being aboard and pressing Set route is enough: the train and its booked
+// destination are already selected.
+let autoDetectedTrainsetId = null;
+
+function selectStationForTrack(trackDisplayId) {
+  for (const [yardId, tracks] of stationTracks) {
+    const match = tracks.some(track =>
+      (typeof track === 'string' ? track : track.id) === trackDisplayId ||
+      (typeof track === 'object' && track.display === trackDisplayId));
+    if (!match)
+      continue;
+    routeStationSelect.value = yardId;
+    updateRouteTrackList();
+    for (const option of routeTrackSelect.options) {
+      if (option.value === trackDisplayId || option.textContent === trackDisplayId) {
+        routeTrackSelect.value = option.value;
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+function refreshCurrentTrain() {
+  return fetch(new URL('/currentTrain', location))
+    .then(response => response.json())
+    .then(current => {
+      const status = document.getElementById('routeCurrentTrain');
+      if (!current.inTrain || current.trainsetId < 0) {
+        autoDetectedTrainsetId = null;
+        if (status)
+          status.textContent = 'Not aboard a train.';
+        return;
+      }
+
+      // Only move the selection when the detected train changes, so a manual
+      // choice is not overwritten on every poll.
+      const changed = autoDetectedTrainsetId !== current.trainsetId;
+      autoDetectedTrainsetId = current.trainsetId;
+      if (changed) {
+        routeTrainSelect.value = String(current.trainsetId);
+        if (current.destinationTrack)
+          selectStationForTrack(current.destinationTrack);
+      }
+
+      if (status) {
+        const parts = [`Aboard ${current.carId}`];
+        if (current.jobId)
+          parts.push(`job ${current.jobId}`);
+        if (current.destinationTrack)
+          parts.push(`to ${current.destinationTrack}`);
+        status.textContent = parts.join(' - ');
+      }
+    })
     .catch(() => {});
 }
 
@@ -1241,6 +1344,9 @@ function updateOnce() {
         break;
       case 'player':
         updatePlayerOverlays(data);
+        break;
+      case 'routes':
+        renderRoutes(data);
         break;
       default:
         const segments = tag.split('-');

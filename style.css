@@ -513,3 +513,13 @@ body.theme-dark .followControl a.followControlButton.active,
 body.theme-dark .followControl a.followControlButton.active svg {
   color: var(--rd-accent-text);
 }
+
+#routeCurrentTrain {
+  font-size: 12px;
+  color: var(--rd-text-muted);
+  padding: 4px 6px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--rd-accent);
+  background: var(--rd-panel-alt);
+  border-radius: 3px;
+}

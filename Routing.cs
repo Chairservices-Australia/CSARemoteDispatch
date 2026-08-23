@@ -197,10 +197,12 @@ namespace DvMod.RemoteDispatch
             }
             route.requiresReverse = reversed;
 
+            // FullDisplayID, matching both the /track keys the map draws with and
+            // the IDs the game prints on jobs.
             route.trackIds = path
                 .Select(step => step.track.LogicTrack())
                 .Where(track => track != null)
-                .Select(track => track.ID.FullID)
+                .Select(track => track.ID.FullDisplayID)
                 .ToList();
             route.settings = SettingsForPath(path);
 
@@ -225,7 +227,8 @@ namespace DvMod.RemoteDispatch
         /// Left-hand running is expressed as a cost penalty in the search: a
         /// right-hand branch costs extra, so an equal-length left road always
         /// wins, while a much shorter right-hand route is still available.
-        public const float LeftTurnPenalty = 250f;
+        /// Tunable from the mod settings.
+        public static float LeftTurnPenalty => Main.settings.leftHandBias;
 
         /// Penalty applied when a transition diverges to the right at a facing
         /// junction. Trailing moves are not penalised: the switch does not choose

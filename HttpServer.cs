@@ -109,6 +109,10 @@ namespace DvMod.RemoteDispatch
             case "res":
                 RenderResource(context);
                 break;
+            case "currentTrain":
+                Render200(context, ContentTypes.Json,
+                    CurrentTrain.GetCurrentTrainJson().ToString(Formatting.None));
+                break;
             case "route":
                 HandleRouteRequest(context);
                 break;

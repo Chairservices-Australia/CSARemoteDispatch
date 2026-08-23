@@ -11,6 +11,12 @@ namespace DvMod.RemoteDispatch
         public int serverPort = 7245;
         public string serverPassword = "";
         public Permissions permissions = new Permissions();
+        /// Extra cost, in metres, charged to a right-hand divergence at a facing
+        /// junction. Left-hand running is a preference rather than a rule, so a
+        /// much shorter right-hand route stays reachable; raise this to hold the
+        /// left road harder, or drop it to zero to route purely by distance.
+        public float leftHandBias = 5000f;
+
         public bool showUndiscoveredLocomotives = false;
         public bool enableLogging = false;
 
@@ -42,6 +48,11 @@ namespace DvMod.RemoteDispatch
             GUILayout.EndHorizontal();
 
             permissions.Draw();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"Left-hand running bias: {leftHandBias:F0} m", GUILayout.Width(220f));
+            leftHandBias = Mathf.Round(GUILayout.HorizontalSlider(leftHandBias, 0f, 20000f, GUILayout.Width(200f)) / 250f) * 250f;
+            GUILayout.EndHorizontal();
 
             var newShowUndiscoveredLocomotives = GUILayout.Toggle(
                 showUndiscoveredLocomotives,
