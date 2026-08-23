@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CSARemoteDispatch</AssemblyName>
     <RootNamespace>DvMod.RemoteDispatch</RootNamespace>
-    <InformationalVersion>1.2.1</InformationalVersion>
+    <InformationalVersion>1.0.0</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

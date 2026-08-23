@@ -2,7 +2,7 @@
   "Id": "CSARemoteDispatch",
   "DisplayName": "CSA Remote Dispatch",
   "Author": "Zeibach (fork)",
-  "Version": "1.2.1",
+  "Version": "1.0.0",
   "AssemblyName": "CSARemoteDispatch.dll",
   "EntryMethod": "DvMod.RemoteDispatch.Main.Load",
   "Requirements": [ "DVSignals" ],

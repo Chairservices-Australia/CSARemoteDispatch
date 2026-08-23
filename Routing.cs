@@ -314,23 +314,27 @@ namespace DvMod.RemoteDispatch
             List<TrackGraph.Step>? path = null;
             var chosen = candidates[0];
             var shortestLength = float.MaxValue;
+            var bestRouteCost = float.MaxValue;
 
             // Every connected track is traversable, including tracks belonging
             // to intermediate stations and yards. The selected destination is
-            // the only terminal condition. Choose the physically shortest road
-            // from either end of the consist; junction side is diagnostic only
-            // and must not force a train onto a longer route.
+            // the only terminal condition. Distance remains the main cost, with
+            // a small right-hand penalty so parallel and near-equivalent roads
+            // settle onto the left without sending trains on large detours.
             foreach (var candidate in candidates)
             {
-                var found = TrackGraph.FindPath(candidate, goals);
+                var found = TrackGraph.FindPath(candidate, goals, extraCost: LeftHandRunningPenalty);
                 if (found == null)
                     continue;
                 var length = PathLength(found);
-                if (path == null || length < shortestLength)
+                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters;
+                if (path == null || routeCost < bestRouteCost
+                    || (Mathf.Approximately(routeCost, bestRouteCost) && length < shortestLength))
                 {
                     path = found;
                     chosen = candidate;
                     shortestLength = length;
+                    bestRouteCost = routeCost;
                 }
             }
 
@@ -495,8 +499,17 @@ namespace DvMod.RemoteDispatch
             route.allocationApplied = false;
         }
 
-        /// Reports whether a path takes the right-hand option. This no longer
-        /// affects route cost: the quickest/shortest connected road wins.
+        /// A modest distance-equivalent cost for taking the right-hand road at
+        /// a facing junction. This resolves parallel and near-equal alternatives
+        /// to the left, while an actually shorter road still wins once it saves
+        /// more than this amount per right-hand divergence.
+        private const float RightHandCostMeters = 25f;
+
+        private static float LeftHandRunningPenalty(TrackGraph.Step from, TrackGraph.Step to) =>
+            IsRightHandChoice(from, to) ? RightHandCostMeters : 0f;
+
+        /// Reports whether a path takes the right-hand option relative to its
+        /// actual direction of travel.
         private static bool IsRightHandChoice(TrackGraph.Step from, TrackGraph.Step to)
         {
             if (!IsFacingChoice(from, out var junction))
@@ -513,6 +526,17 @@ namespace DvMod.RemoteDispatch
             // to have no left option and allowed the rightmost road to win.
             var leftmostOffset = LeftmostOffset(junction, junctionPosition, approach);
             return chosenOffset < leftmostOffset - BranchSideToleranceMeters;
+        }
+
+        private static int CountRightHandChoices(List<TrackGraph.Step> path)
+        {
+            var count = 0;
+            for (var i = 0; i + 1 < path.Count; i++)
+            {
+                if (IsRightHandChoice(path[i], path[i + 1]))
+                    count++;
+            }
+            return count;
         }
 
         private const float BranchSideToleranceMeters = 0.25f;
