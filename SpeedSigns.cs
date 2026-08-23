@@ -22,14 +22,17 @@ namespace DvMod.RemoteDispatch
             public readonly int kph;
             public readonly RailTrack track;
             public readonly float trackPosition;
+            public readonly bool? arrowLeft;
 
-            public Sign(Vector3 position, Vector3 facing, int kph, RailTrack track, float trackPosition)
+            public Sign(Vector3 position, Vector3 facing, int kph, RailTrack track,
+                float trackPosition, bool? arrowLeft)
             {
                 this.position = position;
                 this.facing = facing;
                 this.kph = kph;
                 this.track = track;
                 this.trackPosition = trackPosition;
+                this.arrowLeft = arrowLeft;
             }
         }
 
@@ -44,7 +47,7 @@ namespace DvMod.RemoteDispatch
             public int limit;
         }
 
-        private static readonly Dictionary<Vector3Int, Sign> known = new Dictionary<Vector3Int, Sign>();
+        private static readonly Dictionary<string, Sign> known = new Dictionary<string, Sign>();
         private static readonly Dictionary<int, TrainState> trainStates = new Dictionary<int, TrainState>();
         private static readonly Dictionary<Vector2Int, List<RailTrack>> trackGrid =
             new Dictionary<Vector2Int, List<RailTrack>>();
@@ -83,8 +86,9 @@ namespace DvMod.RemoteDispatch
             {
                 if (data == null || data.signParameters == null)
                     continue;
-                foreach (var parameters in data.signParameters)
+                for (var i = 0; i < data.signParameters.Length; i++)
                 {
+                    var parameters = data.signParameters[i];
                     if (!IsSpeedLimit(parameters.type))
                         continue;
                     if (!TryParseSpeed(parameters.signText, out var kph))
@@ -92,16 +96,27 @@ namespace DvMod.RemoteDispatch
 
                     var transform = data.transform;
                     var position = transform.position;
-                    var key = new Vector3Int(
-                        Mathf.RoundToInt(position.x),
-                        Mathf.RoundToInt(position.y),
-                        Mathf.RoundToInt(position.z));
+                    // Junction boards are generated as speed, arrow, speed,
+                    // arrow on one pole. Key by component and parameter index so
+                    // both limits survive instead of the first one hiding the
+                    // second merely because they share a world position.
+                    var key = data.GetInstanceID() + ":" + i;
                     if (known.ContainsKey(key))
                         continue;
                     if (!NearestTrack(position, transform.forward, NearbyTracks(position),
                         out var track, out var trackPosition))
                         continue;
-                    known[key] = new Sign(position, transform.forward, kph, track, trackPosition);
+                    bool? arrowLeft = null;
+                    if (i + 1 < data.signParameters.Length)
+                    {
+                        var nextType = data.signParameters[i + 1].type;
+                        if (nextType == SignType.ArrowLeft)
+                            arrowLeft = true;
+                        else if (nextType == SignType.ArrowRight)
+                            arrowLeft = false;
+                    }
+                    known[key] = new Sign(position, transform.forward, kph, track,
+                        trackPosition, arrowLeft);
                 }
             }
         }
@@ -196,6 +211,8 @@ namespace DvMod.RemoteDispatch
                         && sign.trackPosition >= trainPosition - CrossingToleranceMeters;
                 if (!crossed)
                     continue;
+                if (!AppliesToSelectedBranch(sign, movement > 0f))
+                    continue;
 
                 // If more than one sign was crossed between UI updates, the last
                 // one in the direction of travel defines the new block.
@@ -220,6 +237,8 @@ namespace DvMod.RemoteDispatch
             {
                 if (sign.track != track || !FacesTrain(sign, heading))
                     continue;
+                if (!AppliesToSelectedBranch(sign, increasing))
+                    continue;
                 var passed = increasing
                     ? trainPosition - sign.trackPosition
                     : sign.trackPosition - trainPosition;
@@ -229,6 +248,24 @@ namespace DvMod.RemoteDispatch
                 result = sign.kph;
             }
             return result;
+        }
+
+        /// Arrowed limits on a stacked junction board apply only to the road
+        /// selected by that arrow. DV creates the pair in out-branch order:
+        /// ArrowLeft for branch 0 and ArrowRight for branch 1.
+        private static bool AppliesToSelectedBranch(Sign sign, bool increasing)
+        {
+            if (!sign.arrowLeft.HasValue)
+                return true;
+
+            var junction = increasing ? sign.track.outJunction : sign.track.inJunction;
+            if (junction == null || junction.inBranch == null
+                || junction.inBranch.track != sign.track
+                || junction.outBranches == null || junction.outBranches.Count < 2)
+                return false;
+
+            var indicatedBranch = sign.arrowLeft.Value ? 0 : 1;
+            return junction.selectedBranch == indicatedBranch;
         }
 
         private static bool FacesTrain(Sign sign, Vector3 heading)
