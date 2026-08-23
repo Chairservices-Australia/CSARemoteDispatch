@@ -12,9 +12,11 @@ namespace DvMod.RemoteDispatch
     {
         private const int SignSize = 96;
         private const int LampSize = 34;
-        private const float MarginX = 24f;
+        private const float MarginX = 32f;
         private const float MarginY = 24f;
         private const float Gap = 12f;
+        private const float StatusWidth = 340f;
+        private const float StatusEdgeMargin = 12f;
 
         private static Texture2D? speedSignTexture;
         private static Texture2D? signalBodyTexture;
@@ -89,50 +91,53 @@ namespace DvMod.RemoteDispatch
 
             DrawSpeedSign(new Rect(signX, signY, SignSize, SignSize), reading.speedLimitKph);
             DrawSignal(new Rect(signalX, signalY, signalWidth, signalHeight), reading.aspect);
+
+            // Anchor the instruction panel to the same safe right margin as the
+            // signal. The old centred box extended beyond the screen edge and
+            // clipped longer text.
+            var statusRight = Screen.width - MarginX;
+            var statusWidth = Mathf.Min(StatusWidth, statusRight - StatusEdgeMargin);
+            var statusRect = new Rect(statusRight - statusWidth,
+                signalY + signalHeight + 8f, statusWidth, 78f);
             if (reading.passToCouple)
             {
-                DrawPassToCouple(new Rect(signalX - 65f, signalY + signalHeight + 5f,
-                    signalWidth + 130f, 58f), reading.approachingDistanceMeters);
+                DrawSignalMessage(statusRect, "Pass to Couple",
+                    reading.approachingDistanceMeters, new Color(1f, 0.72f, 0.12f));
             }
-            else if ((reading.aspect == Aspect.Stop || reading.aspect == Aspect.Caution
-                    || reading.aspect == Aspect.PreliminaryCaution)
-                && reading.approachingDistanceMeters >= 0f)
+            else if (reading.aspect == Aspect.PreliminaryCaution)
             {
-                DrawApproaching(new Rect(signalX - 45f, signalY + signalHeight + 5f,
-                    signalWidth + 90f, 42f), reading.approachingDistanceMeters);
+                DrawSignalMessage(statusRect,
+                    "Proceed, but be ready to stop at the signal after next.",
+                    reading.approachingDistanceMeters, new Color(1f, 0.72f, 0.12f));
+            }
+            else if (reading.aspect == Aspect.Caution)
+            {
+                DrawSignalMessage(statusRect,
+                    "Proceed, but be ready to stop at the next signal.",
+                    reading.approachingDistanceMeters, new Color(1f, 0.72f, 0.12f));
+            }
+            else if (reading.aspect == Aspect.Stop)
+            {
+                DrawSignalMessage(statusRect, "Stop, do not proceed.",
+                    reading.approachingDistanceMeters, new Color(1f, 0.35f, 0.3f));
             }
         }
 
-        private static void DrawPassToCouple(Rect rect, float distanceMeters)
+        private static void DrawSignalMessage(
+            Rect rect, string message, float distanceMeters, Color colour)
         {
             var style = new GUIStyle(GUI.skin.label)
             {
                 alignment = TextAnchor.UpperCenter,
                 fontSize = 13,
                 fontStyle = FontStyle.Bold,
-                wordWrap = false,
+                wordWrap = true,
             };
-            style.normal.textColor = new Color(1f, 0.72f, 0.12f);
+            style.normal.textColor = colour;
             var distance = distanceMeters < 0f ? "" : distanceMeters >= 1000f
                 ? "\nApproaching: " + (distanceMeters / 1000f).ToString("0.0") + " km"
                 : "\nApproaching: " + Mathf.RoundToInt(distanceMeters) + " m";
-            GUI.Label(rect, "Pass to Couple" + distance, style);
-        }
-
-        private static void DrawApproaching(Rect rect, float distanceMeters)
-        {
-            var style = new GUIStyle(GUI.skin.label)
-            {
-                alignment = TextAnchor.UpperCenter,
-                fontSize = 13,
-                fontStyle = FontStyle.Bold,
-                wordWrap = false,
-            };
-            style.normal.textColor = Color.white;
-            var distance = distanceMeters >= 1000f
-                ? (distanceMeters / 1000f).ToString("0.0") + " km"
-                : Mathf.RoundToInt(distanceMeters) + " m";
-            GUI.Label(rect, "Approaching:\n" + distance, style);
+            GUI.Label(rect, message + distance, style);
         }
 
         private void DrawSpeedSign(Rect rect, int kph)
