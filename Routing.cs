@@ -1046,7 +1046,7 @@ namespace DvMod.RemoteDispatch
             {
                 if (setting.junction.selectedBranch == setting.branch)
                     continue;
-                if (Occupancy.IsJunctionClear(setting.junction, route.trainsetId))
+                if (Occupancy.IsJunctionClear(setting.junction))
                     setting.junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                 else
                     route.pending.Add(setting.junction);
@@ -1206,7 +1206,7 @@ namespace DvMod.RemoteDispatch
                     route.pending.Remove(setting.junction);
                     continue;
                 }
-                if (Occupancy.IsJunctionClear(setting.junction, route.trainsetId))
+                if (Occupancy.IsJunctionClear(setting.junction))
                 {
                     setting.junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                     route.pending.Remove(setting.junction);
@@ -1516,7 +1516,7 @@ namespace DvMod.RemoteDispatch
                         var setting = route.settings.FirstOrDefault(s => s.junction == junction);
                         if (setting == null)
                             continue;
-                        if (Occupancy.IsJunctionClear(junction, route.trainsetId))
+                        if (Occupancy.IsJunctionClear(junction))
                             junction.Switch(Junction.SwitchMode.NO_SOUND, setting.branch);
                         else
                             stillPending.Add(junction);

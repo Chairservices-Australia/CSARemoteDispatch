@@ -339,13 +339,25 @@ namespace DvMod.RemoteDispatch
                             + "in the CSA Remote Dispatch settings in Unity Mod Manager.");
                         return;
                     }
+                    var junctionBlocked = false;
                     var newSelectedBranch = await Updater.RunOnMainThread(() =>
                     {
-                        Main.DebugLog(() => $"Toggling J-{junctionId}.");
                         var junction = RailTrackRegistry.Instance.OrderedJunctions[junctionId];
+                        if (!Occupancy.IsJunctionClear(junction))
+                        {
+                            junctionBlocked = true;
+                            Main.DebugLog(() => $"Refusing to toggle occupied J-{junctionId}.");
+                            return junction.selectedBranch;
+                        }
+                        Main.DebugLog(() => $"Toggling J-{junctionId}.");
                         junction.Switch(Junction.SwitchMode.REGULAR);
                         return junction.selectedBranch;
                     }).ConfigureAwait(false);
+                    if (junctionBlocked)
+                    {
+                        RenderError(context, 409, "Junction is occupied and cannot be switched until it is clear.");
+                        return;
+                    }
                     Render200(context, new JValue(newSelectedBranch));
                     return;
                 }

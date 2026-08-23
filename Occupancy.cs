@@ -129,9 +129,9 @@ namespace DvMod.RemoteDispatch
             TracksOccupiedBy(Trainset.allSets?.Find(set => set != null && set.id == trainsetId), into);
 
         /// True when no car sits close enough to the junction that throwing it
-        /// would derail something. `ignoreTrainsetId` excludes the train being
-        /// routed, which may legitimately be standing on its own switch.
-        public static bool IsJunctionClear(Junction junction, int ignoreTrainsetId = -1)
+        /// would derail something. Every consist counts, including the train
+        /// whose route requested the switch.
+        public static bool IsJunctionClear(Junction junction)
         {
             if (junction == null)
                 return false;
@@ -151,10 +151,6 @@ namespace DvMod.RemoteDispatch
                     for (var i = 0; i < bucket.Count; i++)
                     {
                         var position = bucket[i];
-                        if (ignoreTrainsetId >= 0
-                            && position.car.trainset != null
-                            && position.car.trainset.id == ignoreTrainsetId)
-                            continue;
                         if (Vector3.Distance(position.position, junctionPosition) <= JunctionClearanceMeters)
                             return false;
                     }
