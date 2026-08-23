@@ -64,6 +64,15 @@ namespace DvMod.RemoteDispatch
 
         public void Update()
         {
+            var hotkey = Main.settings.signalHudHotkey;
+            if (hotkey != KeyCode.None && !Main.settings.IsCapturingSignalHudHotkey
+                && Input.GetKeyDown(hotkey))
+            {
+                Main.settings.showSignalHud = !Main.settings.showSignalHud;
+                if (Main.mod != null)
+                    Main.settings.Save(Main.mod);
+            }
+
             // Reading the line walks track and scans every car, so it runs a few
             // times a second rather than every frame.
             if (Time.time < nextReadTime)

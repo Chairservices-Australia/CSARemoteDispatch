@@ -13,6 +13,7 @@ namespace DvMod.RemoteDispatch
         public Permissions permissions = new Permissions();
         /// In-game speed sign and signal overlay, top right.
         public bool showSignalHud = true;
+        public KeyCode signalHudHotkey = KeyCode.F8;
 
         public bool showUndiscoveredLocomotives = false;
         public bool enableLogging = false;
@@ -22,6 +23,9 @@ namespace DvMod.RemoteDispatch
         const char EnDash = '\u2013';
         private string uncommittedPort = "initial";
         private string message = "";
+        private bool capturingSignalHudHotkey;
+
+        public bool IsCapturingSignalHudHotkey => capturingSignalHudHotkey;
 
         public void Draw()
         {
@@ -55,7 +59,41 @@ namespace DvMod.RemoteDispatch
                 CarUpdater.ForceCarRefresh();
             }
 
-            showSignalHud = GUILayout.Toggle(showSignalHud, "Show in-game speed sign and signal");
+            GUILayout.Space(6f);
+            GUILayout.Label("Signal HUD:");
+            showSignalHud = GUILayout.Toggle(showSignalHud,
+                "Show in-game speed sign and signal HUD");
+
+            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(false));
+            GUILayout.Label("Toggle HUD hotkey", GUILayout.Width(130f));
+            var hotkeyLabel = capturingSignalHudHotkey
+                ? "Press a key..."
+                : signalHudHotkey == KeyCode.None ? "Not bound" : signalHudHotkey.ToString();
+            if (GUILayout.Button(hotkeyLabel, GUILayout.Width(150f)))
+                capturingSignalHudHotkey = true;
+            GUILayout.EndHorizontal();
+            GUILayout.Label("Click the button and press a key. Backspace/Delete clears the binding.");
+
+            if (capturingSignalHudHotkey && Event.current.type == EventType.KeyDown)
+            {
+                var pressed = Event.current.keyCode;
+                if (pressed == KeyCode.Escape)
+                {
+                    capturingSignalHudHotkey = false;
+                }
+                else if (pressed == KeyCode.Backspace || pressed == KeyCode.Delete)
+                {
+                    signalHudHotkey = KeyCode.None;
+                    capturingSignalHudHotkey = false;
+                }
+                else if (pressed != KeyCode.None)
+                {
+                    signalHudHotkey = pressed;
+                    capturingSignalHudHotkey = false;
+                }
+                Event.current.Use();
+            }
+
             enableLogging = GUILayout.Toggle(enableLogging, "Enable logging");
 
             GUILayout.EndVertical();
