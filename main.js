@@ -199,13 +199,13 @@ function getCarLengthScale() {
 }
 
 function getCarWidthScale() {
-  // Capped against the shortest car so a wide setting cannot make a vehicle
-  // broader than it is long, which reads as a bar across the track.
+  // Keep the widest setting within the footprint of the shortest vehicle while
+  // still allowing every dropdown option, including Huge, to be distinct.
   return carZoomClamp() * Math.min(getCarScale(), maxCarWidthRatio * shortestCarLength / carWidthMeters);
 }
 
 // Widest a car may be drawn relative to its own length.
-const maxCarWidthRatio = 0.5;
+const maxCarWidthRatio = 0.8;
 const shortestCarLength = 12;
 
 function refreshAllCarMarkers() {
@@ -1253,12 +1253,17 @@ function updateAllCarColors() {
 
 const locoShapeNoseDepth = 10;
 
+function getCarRenderWidthPx() {
+  return carWidthPx * getCarWidthScale() / getCarLengthScale();
+}
+
 function createCarShape(carId, carData) {
   const isLoco = carId.slice(0,2) == 'L-';
   const lengthPx = carData.length * svgPixelsPerMeter;
+  const widthPx = getCarRenderWidthPx();
   const svg = isLoco
-    ? `<polygon points="${-lengthPx/2},-${carWidthPx/2} ${-lengthPx/2},${carWidthPx/2} ${lengthPx/2-locoShapeNoseDepth},${carWidthPx/2} ${lengthPx/2},0 ${lengthPx/2-locoShapeNoseDepth},-${carWidthPx/2}" fill="goldenrod" fill-opacity="70%" stroke="black" stroke-width="1%"/>`
-    : `<rect x="${-lengthPx/2}" y="-10" width="${lengthPx}" height="20" fill-opacity="70%" stroke="black" stroke-width="1%"/>`;
+    ? `<polygon points="${-lengthPx/2},-${widthPx/2} ${-lengthPx/2},${widthPx/2} ${lengthPx/2-locoShapeNoseDepth},${widthPx/2} ${lengthPx/2},0 ${lengthPx/2-locoShapeNoseDepth},-${widthPx/2}" fill="goldenrod" fill-opacity="70%" stroke="black" stroke-width="1%"/>`
+    : `<rect x="${-lengthPx/2}" y="${-widthPx/2}" width="${lengthPx}" height="${widthPx}" fill-opacity="70%" stroke="black" stroke-width="1%"/>`;
   return svg;
 }
 
@@ -1284,11 +1289,12 @@ function createCarLabel(carId, carData) {
 
 function createCarOverlay(carId, carData) {
   const lengthPx = carData.length * svgPixelsPerMeter;
-  const carCanvasMajor = Math.sqrt(lengthPx / 2 * lengthPx / 2 + carWidthPx / 2 * carWidthPx / 2);
+  const widthPx = getCarRenderWidthPx();
+  const carCanvasMajor = Math.sqrt(lengthPx / 2 * lengthPx / 2 + widthPx / 2 * widthPx / 2);
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('id', carId);
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-  svg.setAttribute('viewBox', `${-carCanvasMajor} ${-carWidthPx/2} ${carCanvasMajor*2} ${carWidthPx}`);
+  svg.setAttribute('viewBox', `${-carCanvasMajor} ${-widthPx/2} ${carCanvasMajor*2} ${widthPx}`);
   return svg
 }
 
@@ -1299,7 +1305,12 @@ function updateCarMarker(carId) {
   const carData = allCarData.get(carId);
   marker.setBounds(getCarOverlayBounds(carData));
   marker.setRotationAngle(carData.rotation - 90);
-  marker.getElement().innerHTML = createCarShape(carId, carData) + createCarLabel(carId, carData);
+  const svg = marker.getElement();
+  const lengthPx = carData.length * svgPixelsPerMeter;
+  const widthPx = getCarRenderWidthPx();
+  const carCanvasMajor = Math.sqrt(lengthPx / 2 * lengthPx / 2 + widthPx / 2 * widthPx / 2);
+  svg.setAttribute('viewBox', `${-carCanvasMajor} ${-widthPx/2} ${carCanvasMajor*2} ${widthPx}`);
+  svg.innerHTML = createCarShape(carId, carData) + createCarLabel(carId, carData);
   updateCarColor(carId);
 }
 
