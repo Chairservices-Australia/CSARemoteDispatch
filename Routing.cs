@@ -751,8 +751,20 @@ namespace DvMod.RemoteDispatch
             var controller = Signalling.NextDvSignalController(
                 step, lead.transform.position);
             var signal = controller?.GetControllerSignal();
-            if (signal == null || signal == route.reservedSignal)
+            if (signal == null)
                 return true;
+
+            if (signal == route.reservedSignal)
+            {
+                // DV Signals or multiplayer can drop a reservation after it was
+                // granted. Remembering the Signal object is not proof that its
+                // block is still reserved; treating it as success leaves an
+                // otherwise empty signal at red forever. Reacquire below.
+                if (TrackReserver.HasReservation(signal))
+                    return true;
+                route.reservedSignal = null;
+                Main.DebugLog(() => $"Route {route.id}: signal reservation was lost; reacquiring.");
+            }
 
             if (route.reservedSignal != null && TrackReserver.HasReservation(route.reservedSignal))
                 ReleaseSignal(route.reservedSignal);
