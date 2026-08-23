@@ -26,6 +26,7 @@ namespace DvMod.RemoteDispatch
     public static class Signalling
     {
         public const float SpeedLookaheadMeters = 400f;
+        public const int DefaultSpeedLimitKph = 30;
 
         /// Standard sign values, so the readout matches the numbers a driver
         /// expects rather than an arbitrary computed figure.
@@ -93,7 +94,8 @@ namespace DvMod.RemoteDispatch
             // latches either value until the leading end crosses another sign.
             SpeedSigns.ScanIfDue();
             var speed = SpeedSigns.LimitAt(
-                ownTrainsetId, leadCar, heading, () => SpeedLimitFor(start.Value));
+                ownTrainsetId, leadCar, heading,
+                () => Mathf.Max(DefaultSpeedLimitKph, SpeedLimitFor(start.Value)));
             return new Reading(aspect, speed, blockAhead, approachingDistance);
         }
 
