@@ -204,6 +204,36 @@ namespace DvMod.RemoteDispatch
         private static bool Contains(string value, string text) =>
             value.IndexOf(text, System.StringComparison.OrdinalIgnoreCase) >= 0;
 
+        /// Apply the coupling indication to DVSignals' physical main signal as
+        /// well as the CSA HUD. We select a blinking-amber aspect already
+        /// supplied by the active signal pack, so lamp animation and multiplayer
+        /// aspect notifications continue to be owned by DVSignals.
+        [HarmonyPatch(typeof(Signals.Game.Signal), nameof(Signals.Game.Signal.UpdateAspect))]
+        private static class CouplingAspectPatch
+        {
+            private static void Postfix(Signals.Game.Signal __instance)
+            {
+                if (__instance == null || __instance.Parent != null || __instance.IsShunting
+                    || __instance.Operation != SignalOperationMode.Automatic)
+                    return;
+
+                var block = __instance.Block;
+                if (block == null || !Occupancy.ContainsOnlyUnpoweredCars(
+                    block.Tracks.Select(info => info.Track)))
+                    return;
+
+                for (var i = 0; i < __instance.AllAspects.Length; i++)
+                {
+                    var definition = __instance.AllAspects[i].GetDefinition();
+                    var blinking = definition.BlinkingLights ?? new SignalLightDefinition[0];
+                    if (!blinking.Any(light => IsAmber(light.Colour)))
+                        continue;
+                    __instance.ChangeAspect(i);
+                    return;
+                }
+            }
+        }
+
         /// DV Signals' default pack includes a three-lamp main controller plus
         /// optional four-lamp variants for entries, exits and combined signals.
         /// NSW mode consistently uses the three-lamp controller for all main

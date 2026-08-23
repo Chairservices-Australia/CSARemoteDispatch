@@ -11,6 +11,10 @@ namespace DvMod.RemoteDispatch
         /// switch under a car derails it, so this is deliberately generous.
         public const float JunctionClearanceMeters = 20f;
 
+        private static readonly Dictionary<RailTrack, HashSet<TrainCar>> carsByTrack =
+            new Dictionary<RailTrack, HashSet<TrainCar>>();
+        private static int carIndexFrame = -1;
+
         public readonly struct CarPosition
         {
             public readonly TrainCar car;
@@ -106,20 +110,37 @@ namespace DvMod.RemoteDispatch
         public static bool ContainsOnlyUnpoweredCars(
             IEnumerable<RailTrack> tracks, int ignoreTrainsetId = -1)
         {
-            var wanted = new HashSet<RailTrack>(tracks.Where(track => track != null));
+            RefreshCarIndex();
             var foundCar = false;
-            foreach (var position in AllCarPositions())
+            foreach (var track in tracks)
             {
-                if (!wanted.Contains(position.track))
+                if (track == null || !carsByTrack.TryGetValue(track, out var cars))
                     continue;
-                var trainset = position.car.trainset;
-                if (ignoreTrainsetId >= 0 && trainset != null && trainset.id == ignoreTrainsetId)
-                    continue;
-                foundCar = true;
-                if (position.car.IsLoco)
-                    return false;
+                foreach (var car in cars)
+                {
+                    var trainset = car.trainset;
+                    if (ignoreTrainsetId >= 0 && trainset != null && trainset.id == ignoreTrainsetId)
+                        continue;
+                    foundCar = true;
+                    if (car.IsLoco)
+                        return false;
+                }
             }
             return foundCar;
+        }
+
+        private static void RefreshCarIndex()
+        {
+            if (carIndexFrame == Time.frameCount)
+                return;
+            carIndexFrame = Time.frameCount;
+            carsByTrack.Clear();
+            foreach (var position in AllCarPositions())
+            {
+                if (!carsByTrack.TryGetValue(position.track, out var cars))
+                    carsByTrack[position.track] = cars = new HashSet<TrainCar>();
+                cars.Add(position.car);
+            }
         }
     }
 }
