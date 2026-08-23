@@ -211,6 +211,40 @@ namespace DvMod.RemoteDispatch
         private static bool Contains(string value, string text) =>
             value.IndexOf(text, System.StringComparison.OrdinalIgnoreCase) >= 0;
 
+        /// Mirror the HUD's car-only coupling indication on DVSignals' physical
+        /// main signal at runtime. This Harmony patch lives entirely in CSA
+        /// Remote Dispatch; no DVSignals files are modified or replaced.
+        [HarmonyPatch(typeof(Signals.Game.Signal), nameof(Signals.Game.Signal.UpdateAspect))]
+        private static class CouplingAspectPatch
+        {
+            private static void Postfix(Signals.Game.Signal __instance)
+            {
+                // Preserve DVSignals' manual controls, subsidiary/distant heads
+                // and shunting indications. Only automatic physical main heads
+                // receive the permissive coupling aspect.
+                if (__instance == null || __instance.Parent != null || __instance.IsShunting
+                    || __instance.Operation != SignalOperationMode.Automatic)
+                    return;
+
+                var block = __instance.Block;
+                if (block == null || !Occupancy.ContainsOnlyUnpoweredCars(
+                    block.Tracks.Select(info => info.Track)))
+                    return;
+
+                // Use the active pack's own flashing-amber aspect, retaining its
+                // lamp animation and DVSignals aspect-change notifications.
+                for (var i = 0; i < __instance.AllAspects.Length; i++)
+                {
+                    var definition = __instance.AllAspects[i].GetDefinition();
+                    var blinking = definition.BlinkingLights ?? new SignalLightDefinition[0];
+                    if (!blinking.Any(light => IsAmber(light.Colour)))
+                        continue;
+                    __instance.ChangeAspect(i);
+                    return;
+                }
+            }
+        }
+
         /// DV Signals' default pack includes a three-lamp main controller plus
         /// optional four-lamp variants for entries, exits and combined signals.
         /// NSW mode consistently uses the three-lamp controller for all main
