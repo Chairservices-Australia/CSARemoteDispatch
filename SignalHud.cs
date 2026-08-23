@@ -21,6 +21,22 @@ namespace DvMod.RemoteDispatch
         private static readonly Texture2D?[] lampTextures = new Texture2D?[6];
 
         private static GUIStyle? speedTextStyle;
+        private static Font? signFont;
+
+        /// Speed signs are set in DIN 1451, the road-sign face. Bahnschrift is
+        /// Microsoft's cut of it and ships with Windows; the rest are condensed
+        /// grotesques in descending order of similarity, ending at whatever the
+        /// default is so the sign always renders.
+        private static readonly string[] SignFontCandidates =
+        {
+            "Bahnschrift SemiBold",
+            "Bahnschrift",
+            "Arial Narrow Bold",
+            "Arial Narrow",
+            "Franklin Gothic Medium Cond",
+            "Arial Black",
+            "Impact",
+        };
 
         private float nextReadTime;
         private Signalling.Reading reading;
@@ -80,17 +96,76 @@ namespace DvMod.RemoteDispatch
             if (speedSignTexture != null)
                 GUI.DrawTexture(rect, speedSignTexture);
 
+            var text = kph.ToString();
+            // Three digits have to sit inside the same ring as two, so the face
+            // is set narrower rather than letting the number overrun the border.
+            var fontSize = Mathf.RoundToInt(SignSize * (text.Length >= 3 ? 0.36f : 0.46f));
+            var style = SpeedTextStyle(fontSize);
+
+            // Centred by measuring the glyphs rather than by anchoring: label
+            // styles carry padding and the line box is taller than the digits,
+            // both of which push an anchored number off centre.
+            var content = new GUIContent(text);
+            var size = style.CalcSize(content);
+            var textRect = new Rect(
+                rect.x + (rect.width - size.x) / 2f,
+                rect.y + (rect.height - size.y) / 2f,
+                size.x,
+                size.y);
+            GUI.Label(textRect, content, style);
+        }
+
+        private static GUIStyle SpeedTextStyle(int fontSize)
+        {
             if (speedTextStyle == null)
             {
-                speedTextStyle = new GUIStyle(GUI.skin.label)
+                speedTextStyle = new GUIStyle
                 {
                     alignment = TextAnchor.MiddleCenter,
-                    fontStyle = FontStyle.Bold,
-                    fontSize = 34,
+                    padding = new RectOffset(0, 0, 0, 0),
+                    margin = new RectOffset(0, 0, 0, 0),
+                    border = new RectOffset(0, 0, 0, 0),
+                    contentOffset = Vector2.zero,
+                    wordWrap = false,
+                    richText = false,
                 };
+                speedTextStyle.normal.background = null;
             }
+
+            if (signFont == null)
+                signFont = LoadSignFont();
+            speedTextStyle.font = signFont;
+            speedTextStyle.fontStyle = signFont == null ? FontStyle.Bold : FontStyle.Normal;
+            speedTextStyle.fontSize = fontSize;
             speedTextStyle.normal.textColor = Color.black;
-            GUI.Label(rect, kph.ToString(), speedTextStyle);
+            return speedTextStyle;
+        }
+
+        private static Font? LoadSignFont()
+        {
+            string[] installed;
+            try
+            {
+                installed = Font.GetOSInstalledFontNames() ?? new string[0];
+            }
+            catch
+            {
+                return null;
+            }
+
+            foreach (var wanted in SignFontCandidates)
+            {
+                foreach (var name in installed)
+                {
+                    if (!string.Equals(name, wanted, System.StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    // Size is set per draw; this only selects the face.
+                    var font = Font.CreateDynamicFontFromOSFont(name, 32);
+                    if (font != null)
+                        return font;
+                }
+            }
+            return null;
         }
 
         private void DrawSignal(Rect rect, Aspect aspect)
