@@ -77,7 +77,12 @@ namespace DvMod.RemoteDispatch
 
             var ahead = BlocksAhead(start.Value, BlocksToRead + 1);
             var aspect = AspectFor(start.Value, ahead, ownTrainsetId);
-            var speed = SpeedLimitFor(start.Value);
+
+            // Prefer the limit the game actually posts; fall back to the figure
+            // derived from curvature only where no sign has been passed.
+            SpeedSigns.ScanIfDue();
+            var posted = SpeedSigns.LimitAt(car.transform.position, heading);
+            var speed = posted ?? SpeedLimitFor(start.Value);
             var blockAhead = ahead.Count > 0 ? DescribeTrack(ahead[0].track) : "";
             return new Reading(aspect, speed, blockAhead);
         }

@@ -22,6 +22,7 @@
     <Reference Include="DV.PointSet"/>
     <Reference Include="BezierCurves"/>
     <Reference Include="DV.RailTrack" />
+    <Reference Include="DV.SignPlacer"/>
     <Reference Include="DV.ThingTypes"/>
     <Reference Include="DV.Utils"/>
     <Reference Include="Microsoft.CSharp"/>

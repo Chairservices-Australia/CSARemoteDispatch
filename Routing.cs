@@ -129,11 +129,18 @@ namespace DvMod.RemoteDispatch
         /// and the sign of that difference is noise; how far each sits to the
         /// left or right of the approach line is unambiguous.
         public static bool IsLeftBranch(
+            Vector3 junctionPosition, Vector3 approachDirection, RailTrack branch, bool branchAtInEnd) =>
+            LateralOffset(junctionPosition, approachDirection, branch, branchAtInEnd) > 0f;
+
+        /// Signed distance a branch sits to the left of the approach line.
+        /// Positive is left. Exposed so a wrong verdict can be told from a
+        /// measurement that never had any signal in it.
+        public static float LateralOffset(
             Vector3 junctionPosition, Vector3 approachDirection, RailTrack branch, bool branchAtInEnd)
         {
             var approach = new Vector3(approachDirection.x, 0, approachDirection.z);
             if (approach.sqrMagnitude < 0.0001f || branch == null)
-                return false;
+                return 0f;
             approach = approach.normalized;
 
             // Unity is left-handed with +X to the right of +Z, so the left-hand
@@ -142,7 +149,7 @@ namespace DvMod.RemoteDispatch
 
             var sampled = PointAlong(branch, branchAtInEnd, BranchSampleMeters);
             var relative = sampled - new Vector3(junctionPosition.x, 0f, junctionPosition.z);
-            return Vector3.Dot(relative, leftNormal) > 0f;
+            return Vector3.Dot(relative, leftNormal);
         }
 
         /// How far along a branch to look when deciding which side it is on.
@@ -397,10 +404,11 @@ namespace DvMod.RemoteDispatch
                 {
                     if (branch == null || branch.track == null)
                         continue;
+                    var offset = LateralOffset(junctionPosition, approach, branch.track, branch.first);
                     options.Add(new JObject(
                         new JProperty("track", DescribeTrack(branch.track)),
-                        new JProperty("side", IsLeftBranch(junctionPosition, approach, branch.track, branch.first)
-                            ? "left" : "right"),
+                        new JProperty("side", offset > 0f ? "left" : "right"),
+                        new JProperty("offset", System.Math.Round(offset, 2)),
                         new JProperty("taken", branch.track == to.track)));
                 }
 
