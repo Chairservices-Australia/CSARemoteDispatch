@@ -177,10 +177,14 @@ function pixelsPerMeter() {
   return Math.abs(oneMeterNorth.y - origin.y);
 }
 
-// Geographic multiplier for car overlays: true scale times the user's setting
-// while that stays legible, then clamped so cars keep a fixed on-screen size as
-// the map zooms out.
-function getCarRenderScale() {
+// Width multiplier for car overlays: true scale times the user's setting while
+// that stays legible, then clamped so cars keep a fixed on-screen size as the
+// map zooms out.
+//
+// Only the width is inflated. Length is drawn true, because a car's position is
+// its centre: stretching the length pushes each car over its neighbours, so an
+// enlarged consist would overlap itself and hide the couplings between vehicles.
+function getCarWidthScale() {
   const userScale = getCarScale();
   const trueWidthPx = carWidthMeters * pixelsPerMeter();
   if (!isFinite(trueWidthPx) || trueWidthPx <= 0)
@@ -1286,9 +1290,8 @@ function updateCarMarker(carId) {
 
 function getCarOverlayBounds(carData) {
   const position = carData.position;
-  const scale = getCarRenderScale();
-  const length = metersToDegrees * carData.length * scale;
-  const width = metersToDegrees * carWidthMeters * scale;
+  const length = metersToDegrees * carData.length;
+  const width = metersToDegrees * carWidthMeters * getCarWidthScale();
   return [ [ position[0] - width/2, position[1] - length/2], [position[0] + width/2, position[1] + length/2] ];
 }
 

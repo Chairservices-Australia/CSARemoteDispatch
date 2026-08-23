@@ -20,6 +20,15 @@ namespace DvMod.RemoteDispatch
         /// In-game speed sign and signal overlay, top right.
         public bool showSignalHud = true;
 
+        /// Hold trains at a red aspect rather than letting them enter an
+        /// occupied block, so the main line stays clear until it resolves.
+        public bool enforceSignals = true;
+
+        /// Extend that to the train the player is driving. Off by default:
+        /// applying the brake under a driver without warning is worse than the
+        /// block it protects.
+        public bool enforceSignalsForPlayerTrain = false;
+
         public bool showUndiscoveredLocomotives = false;
         public bool enableLogging = false;
 
@@ -67,6 +76,9 @@ namespace DvMod.RemoteDispatch
             }
 
             showSignalHud = GUILayout.Toggle(showSignalHud, "Show in-game speed sign and signal");
+            enforceSignals = GUILayout.Toggle(enforceSignals, "Hold routed trains at red signals");
+            enforceSignalsForPlayerTrain = GUILayout.Toggle(
+                enforceSignalsForPlayerTrain, "Also hold the train I am driving");
             enableLogging = GUILayout.Toggle(enableLogging, "Enable logging");
 
             GUILayout.EndVertical();

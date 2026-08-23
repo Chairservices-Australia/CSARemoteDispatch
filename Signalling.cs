@@ -47,37 +47,90 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        /// Read the line ahead of the car the player is in.
+        /// Remembered direction of travel, so the aspect does not flip to the
+        /// other end of the train the moment it stops.
+        private static readonly Dictionary<int, Vector3> lastHeadings = new Dictionary<int, Vector3>();
+
+        /// Read the line ahead of the train the player is in.
         public static Reading ReadForPlayer()
         {
             var car = PlayerManager.Car;
+            return car == null ? new Reading(Aspect.Unknown, 0, "") : ReadFor(car);
+        }
+
+        /// Read the line ahead of the consist a given car belongs to.
+        public static Reading ReadFor(TrainCar car)
+        {
             if (car == null)
                 return new Reading(Aspect.Unknown, 0, "");
 
-            var start = LeadingStep(car);
+            var trainset = car.trainset;
+            var ownTrainsetId = trainset == null ? -1 : trainset.id;
+            var heading = HeadingOf(car, trainset, ownTrainsetId);
+
+            // Read from the end of the consist that leads, which when propelling
+            // or reversing is not the car the player is sitting in.
+            var leadCar = LeadingCar(trainset, car, heading);
+            var start = StepFrom(leadCar, heading);
             if (start == null)
                 return new Reading(Aspect.Unknown, 0, "");
 
-            var ownTrainsetId = car.trainset == null ? -1 : car.trainset.id;
             var ahead = BlocksAhead(start.Value, BlocksToRead + 1);
-            var aspect = AspectFor(ahead, ownTrainsetId);
+            var aspect = AspectFor(start.Value, ahead, ownTrainsetId);
             var speed = SpeedLimitFor(start.Value);
             var blockAhead = ahead.Count > 0 ? DescribeTrack(ahead[0].track) : "";
             return new Reading(aspect, speed, blockAhead);
         }
 
-        /// The step leaving the front of the consist, in the direction it is
-        /// travelling. Falls back to the way the car faces when stationary, so a
-        /// standing train still reads the line it is pointed at.
-        private static TrackGraph.Step? LeadingStep(TrainCar car)
+        /// Direction of travel, from the consist's own motion. Falls back to the
+        /// last direction it moved, and only to where a car points if it has not
+        /// moved at all: while reversing, the way a locomotive faces is the
+        /// opposite of where it is going.
+        private static Vector3 HeadingOf(TrainCar car, Trainset? trainset, int trainsetId)
         {
-            var bogie = car.Bogies?.FirstOrDefault(b => b != null && b.track != null);
+            var velocity = Vector3.zero;
+            var source = trainset?.firstCar ?? car;
+            if (source != null && source.rb != null)
+                velocity = source.rb.velocity;
+            velocity.y = 0;
+
+            // A low threshold on purpose: a train easing back at walking pace is
+            // still going that way, and must not read the line off its nose.
+            if (velocity.sqrMagnitude > 0.0025f)
+            {
+                var normalized = velocity.normalized;
+                if (trainsetId >= 0)
+                    lastHeadings[trainsetId] = normalized;
+                return normalized;
+            }
+
+            if (trainsetId >= 0 && lastHeadings.TryGetValue(trainsetId, out var remembered)
+                && remembered.sqrMagnitude > 0.001f)
+                return remembered;
+
+            var forward = car.transform.forward;
+            forward.y = 0;
+            return forward.normalized;
+        }
+
+        /// The car at the leading end of the consist for this direction.
+        private static TrainCar LeadingCar(Trainset? trainset, TrainCar fallback, Vector3 heading)
+        {
+            var first = trainset?.firstCar;
+            var last = trainset?.lastCar;
+            if (first == null || last == null || first == last)
+                return fallback;
+
+            var alongConsist = first.transform.position - last.transform.position;
+            alongConsist.y = 0;
+            return Vector3.Dot(alongConsist, heading) >= 0f ? first : last;
+        }
+
+        private static TrackGraph.Step? StepFrom(TrainCar car, Vector3 heading)
+        {
+            var bogie = car?.Bogies?.FirstOrDefault(b => b != null && b.track != null);
             if (bogie == null)
                 return null;
-
-            var velocity = car.rb == null ? Vector3.zero : car.rb.velocity;
-            var heading = velocity.sqrMagnitude > 0.25f ? velocity : car.transform.forward;
-            heading.y = 0;
 
             var track = bogie.track;
             var curve = track.curve;
@@ -111,8 +164,13 @@ namespace DvMod.RemoteDispatch
             return blocks;
         }
 
-        private static Aspect AspectFor(List<TrackGraph.Step> ahead, int ownTrainsetId)
+        private static Aspect AspectFor(TrackGraph.Step current, List<TrackGraph.Step> ahead, int ownTrainsetId)
         {
+            // Foreign cars standing on the track the train is already running
+            // along are the closest hazard there is, and used to be missed
+            // entirely because only subsequent blocks were examined.
+            if (IsOccupied(current.track, ownTrainsetId))
+                return Aspect.Stop;
             if (ahead.Count == 0)
                 return Aspect.Unknown;
             if (IsOccupied(ahead[0].track, ownTrainsetId))
