@@ -42,14 +42,16 @@ namespace DvMod.RemoteDispatch
             public readonly int speedLimitKph;
             public readonly string blockAhead;
             public readonly float approachingDistanceMeters;
+            public readonly bool passToCouple;
 
             public Reading(Aspect aspect, int speedLimitKph, string blockAhead,
-                float approachingDistanceMeters = -1f)
+                float approachingDistanceMeters = -1f, bool passToCouple = false)
             {
                 this.aspect = aspect;
                 this.speedLimitKph = speedLimitKph;
                 this.blockAhead = blockAhead;
                 this.approachingDistanceMeters = approachingDistanceMeters;
+                this.passToCouple = passToCouple;
             }
         }
 
@@ -86,8 +88,9 @@ namespace DvMod.RemoteDispatch
             var aspect = Aspect.Unknown;
             var approachingDistance = -1f;
             var blockAhead = "";
+            var passToCouple = false;
             ReadDvSignal(start.Value, leadCar.transform.position, ownTrainsetId,
-                out aspect, out approachingDistance, out blockAhead);
+                out aspect, out approachingDistance, out blockAhead, out passToCouple);
 
             // Prefer the limit the game actually posts; fall back to the figure
             // derived from curvature only for the initial block. SpeedSigns
@@ -96,15 +99,16 @@ namespace DvMod.RemoteDispatch
             var speed = SpeedSigns.LimitAt(
                 ownTrainsetId, leadCar, heading,
                 () => Mathf.Max(DefaultSpeedLimitKph, SpeedLimitFor(start.Value)));
-            return new Reading(aspect, speed, blockAhead, approachingDistance);
+            return new Reading(aspect, speed, blockAhead, approachingDistance, passToCouple);
         }
 
         private static void ReadDvSignal(TrackGraph.Step start, Vector3 position, int ownTrainsetId,
-            out Aspect aspect, out float distance, out string signalName)
+            out Aspect aspect, out float distance, out string signalName, out bool passToCouple)
         {
             aspect = Aspect.Unknown;
             distance = -1f;
             signalName = "";
+            passToCouple = false;
             if (!SignalManager.Running)
                 return;
 
@@ -125,7 +129,10 @@ namespace DvMod.RemoteDispatch
             var block = signal.Block;
             if (block != null && Occupancy.ContainsOnlyUnpoweredCars(
                 block.Tracks.Select(info => info.Track), ownTrainsetId))
+            {
                 aspect = Aspect.PreliminaryCaution;
+                passToCouple = true;
+            }
         }
 
         internal static BasicSignalController? NextDvSignalController(
@@ -203,36 +210,6 @@ namespace DvMod.RemoteDispatch
 
         private static bool Contains(string value, string text) =>
             value.IndexOf(text, System.StringComparison.OrdinalIgnoreCase) >= 0;
-
-        /// Apply the coupling indication to DVSignals' physical main signal as
-        /// well as the CSA HUD. We select a blinking-amber aspect already
-        /// supplied by the active signal pack, so lamp animation and multiplayer
-        /// aspect notifications continue to be owned by DVSignals.
-        [HarmonyPatch(typeof(Signals.Game.Signal), nameof(Signals.Game.Signal.UpdateAspect))]
-        private static class CouplingAspectPatch
-        {
-            private static void Postfix(Signals.Game.Signal __instance)
-            {
-                if (__instance == null || __instance.Parent != null || __instance.IsShunting
-                    || __instance.Operation != SignalOperationMode.Automatic)
-                    return;
-
-                var block = __instance.Block;
-                if (block == null || !Occupancy.ContainsOnlyUnpoweredCars(
-                    block.Tracks.Select(info => info.Track)))
-                    return;
-
-                for (var i = 0; i < __instance.AllAspects.Length; i++)
-                {
-                    var definition = __instance.AllAspects[i].GetDefinition();
-                    var blinking = definition.BlinkingLights ?? new SignalLightDefinition[0];
-                    if (!blinking.Any(light => IsAmber(light.Colour)))
-                        continue;
-                    __instance.ChangeAspect(i);
-                    return;
-                }
-            }
-        }
 
         /// DV Signals' default pack includes a three-lamp main controller plus
         /// optional four-lamp variants for entries, exits and combined signals.

@@ -89,13 +89,34 @@ namespace DvMod.RemoteDispatch
 
             DrawSpeedSign(new Rect(signX, signY, SignSize, SignSize), reading.speedLimitKph);
             DrawSignal(new Rect(signalX, signalY, signalWidth, signalHeight), reading.aspect);
-            if ((reading.aspect == Aspect.Stop || reading.aspect == Aspect.Caution
+            if (reading.passToCouple)
+            {
+                DrawPassToCouple(new Rect(signalX - 65f, signalY + signalHeight + 5f,
+                    signalWidth + 130f, 58f), reading.approachingDistanceMeters);
+            }
+            else if ((reading.aspect == Aspect.Stop || reading.aspect == Aspect.Caution
                     || reading.aspect == Aspect.PreliminaryCaution)
                 && reading.approachingDistanceMeters >= 0f)
             {
                 DrawApproaching(new Rect(signalX - 45f, signalY + signalHeight + 5f,
                     signalWidth + 90f, 42f), reading.approachingDistanceMeters);
             }
+        }
+
+        private static void DrawPassToCouple(Rect rect, float distanceMeters)
+        {
+            var style = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.UpperCenter,
+                fontSize = 13,
+                fontStyle = FontStyle.Bold,
+                wordWrap = false,
+            };
+            style.normal.textColor = new Color(1f, 0.72f, 0.12f);
+            var distance = distanceMeters < 0f ? "" : distanceMeters >= 1000f
+                ? "\nApproaching: " + (distanceMeters / 1000f).ToString("0.0") + " km"
+                : "\nApproaching: " + Mathf.RoundToInt(distanceMeters) + " m";
+            GUI.Label(rect, "Pass to Couple" + distance, style);
         }
 
         private static void DrawApproaching(Rect rect, float distanceMeters)
