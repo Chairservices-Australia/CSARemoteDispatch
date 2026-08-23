@@ -82,6 +82,40 @@ namespace DvMod.RemoteDispatch
             return new Reading(aspect, speed, blockAhead);
         }
 
+        /// Direction the driver has selected, from the reverser, or zero when it
+        /// is centred or no locomotive in the consist reports one.
+        ///
+        /// A standing train has no motion to read, but the reverser still says
+        /// which way it is about to go, which is what the road ahead should be
+        /// laid and read for.
+        public static Vector3 ReverserHeading(Trainset? trainset)
+        {
+            if (trainset?.cars == null)
+                return Vector3.zero;
+
+            foreach (var car in trainset.cars)
+            {
+                if (car == null)
+                    continue;
+                var controller = car.GetComponent<DV.RemoteControls.RemoteControllerModule>();
+                var reverser = controller?.controlsOverrider?.Reverser;
+                if (reverser == null)
+                    continue;
+
+                // Centred: no direction selected.
+                var value = reverser.Value;
+                if (Mathf.Abs(value - 0.5f) < 0.1f)
+                    continue;
+
+                var forward = car.transform.forward;
+                forward.y = 0;
+                if (forward.sqrMagnitude < 0.0001f)
+                    continue;
+                return (value > 0.5f ? forward : -forward).normalized;
+            }
+            return Vector3.zero;
+        }
+
         /// Direction of travel, from the consist's own motion. Falls back to the
         /// last direction it moved, and only to where a car points if it has not
         /// moved at all: while reversing, the way a locomotive faces is the
@@ -103,6 +137,12 @@ namespace DvMod.RemoteDispatch
                     lastHeadings[trainsetId] = normalized;
                 return normalized;
             }
+
+            // Standing still: the reverser says where it is about to go, which
+            // beats both the last direction and the way the cab happens to face.
+            var selected = ReverserHeading(trainset);
+            if (selected.sqrMagnitude > 0.001f)
+                return selected;
 
             if (trainsetId >= 0 && lastHeadings.TryGetValue(trainsetId, out var remembered)
                 && remembered.sqrMagnitude > 0.001f)

@@ -38,6 +38,7 @@ namespace DvMod.RemoteDispatch
         public int rerouteCount;
         public float offRouteSince;
         public bool directionVerified;
+        public string notice = "";   // survives status updates
     }
 
     /// Route planning and safe junction setting.
@@ -86,20 +87,60 @@ namespace DvMod.RemoteDispatch
             return direction;
         }
 
-        /// Left-hand running: at a facing junction prefer the branch that departs
-        /// to the left of the approach direction, matching Australian practice
-        /// and the paired mainlines the DoubleTrack mod lays down.
+        /// A point on a branch a little way out from the junction it leaves.
+        private static Vector3 PointAlong(RailTrack track, bool fromInEnd, float distance)
+        {
+            var pointSet = track == null ? null : track.GetKinkedPointSet();
+            var points = pointSet?.points;
+            if (points == null || points.Length == 0)
+                return track == null ? Vector3.zero : track.transform.position;
+
+            // Walk in from whichever end meets the junction.
+            var startIndex = fromInEnd ? 0 : points.Length - 1;
+            var stepDir = fromInEnd ? 1 : -1;
+            var origin = points[startIndex].position;
+
+            for (var i = startIndex; i >= 0 && i < points.Length; i += stepDir)
+            {
+                var p = points[i].position;
+                var dx = p.x - origin.x;
+                var dz = p.z - origin.z;
+                if (dx * dx + dz * dz >= distance * distance)
+                    return new Vector3((float)p.x, 0f, (float)p.z);
+            }
+
+            var last = points[fromInEnd ? points.Length - 1 : 0].position;
+            return new Vector3((float)last.x, 0f, (float)last.z);
+        }
+
+        /// Which side of the approach a branch lies on.
         ///
-        /// Unity is left-handed with +X to the right of +Z, so the Y component of
-        /// approach x outward is negative for a turn to the left.
-        public static bool IsLeftBranch(Vector3 approachDirection, Vector3 outwardDirection)
+        /// Measured as lateral offset a little way along the branch, not as the
+        /// direction it initially turns. On double track the two roads run
+        /// parallel, so their turn directions differ by a fraction of a degree
+        /// and the sign of that difference is noise; how far each sits to the
+        /// left or right of the approach line is unambiguous.
+        public static bool IsLeftBranch(
+            Vector3 junctionPosition, Vector3 approachDirection, RailTrack branch, bool branchAtInEnd)
         {
             var approach = new Vector3(approachDirection.x, 0, approachDirection.z);
-            var outward = new Vector3(outwardDirection.x, 0, outwardDirection.z);
-            if (approach.sqrMagnitude < 0.0001f || outward.sqrMagnitude < 0.0001f)
+            if (approach.sqrMagnitude < 0.0001f || branch == null)
                 return false;
-            return Vector3.Cross(approach.normalized, outward.normalized).y < 0f;
+            approach = approach.normalized;
+
+            // Unity is left-handed with +X to the right of +Z, so the left-hand
+            // normal of a heading (x, z) is (-z, x).
+            var leftNormal = new Vector3(-approach.z, 0f, approach.x);
+
+            var sampled = PointAlong(branch, branchAtInEnd, BranchSampleMeters);
+            var relative = sampled - new Vector3(junctionPosition.x, 0f, junctionPosition.z);
+            return Vector3.Dot(relative, leftNormal) > 0f;
         }
+
+        /// How far along a branch to look when deciding which side it is on.
+        /// Far enough that parallel roads have visibly separated, short enough
+        /// that a curve further along does not reverse the answer.
+        private const float BranchSampleMeters = 40f;
 
         /// Derive the junction settings a path requires.
         public static List<JunctionSetting> SettingsForPath(List<TrackGraph.Step> path)
@@ -230,26 +271,6 @@ namespace DvMod.RemoteDispatch
                 }
             }
 
-            // Only if left-hand running makes the destination unreachable is the
-            // rule relaxed, so a road always exists even where the layout has no
-            // left-hand option through.
-            if (path == null)
-            {
-                foreach (var candidate in candidates)
-                {
-                    var found = TrackGraph.FindPath(candidate, goals);
-                    if (found == null)
-                        continue;
-                    if (path == null || PathLength(found) < PathLength(path))
-                    {
-                        path = found;
-                        chosen = candidate;
-                    }
-                }
-                if (path != null)
-                    route.message = "No left-hand road available; routed by shortest path. ";
-            }
-
             if (path == null)
             {
                 var reach = candidates.Select(c => TrackGraph.CountReachable(c)).ToList();
@@ -296,32 +317,34 @@ namespace DvMod.RemoteDispatch
             return route;
         }
 
-        /// Left-hand running, enforced rather than priced.
+        /// Cost charged for taking a right-hand branch where a left one exists.
         ///
-        /// At a facing junction where a left-hand branch exists, taking a
-        /// right-hand one is forbidden outright. A cost penalty could always be
-        /// out-argued by a long enough detour, which is why a large one still
-        /// produced right-hand turns; there is no weight at which "prefer" means
-        /// "always". Where every branch turns right the move is allowed, since
-        /// refusing it would only make the destination unreachable.
+        /// Larger than any total path length the world can produce, so a road
+        /// with fewer right-hand turns always beats one with more no matter how
+        /// much longer it is. That gives "always left where possible" without
+        /// forbidding the move outright: an outright ban makes the destination
+        /// unreachable wherever a left branch dead-ends, and the search then
+        /// abandons left-hand running for the whole journey rather than for the
+        /// one junction that needed it.
+        public const float RightHandCost = 1000000f;
+
         private static float RightHandPenalty(TrackGraph.Step from, TrackGraph.Step to)
         {
             if (!IsFacingChoice(from, out var junction))
                 return 0f;
 
+            var junctionPosition = junction!.position;
             var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
-            var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
-            if (IsLeftBranch(approach, outward))
+            if (IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn))
                 return 0f;
 
-            // A right-hand move is only permitted when nothing turns left here.
-            foreach (var branch in junction!.outBranches)
+            // Only charged when there is a left-hand road to take instead.
+            foreach (var branch in junction.outBranches)
             {
                 if (branch == null || branch.track == null || branch.track == to.track)
                     continue;
-                var branchOut = TangentAtEnd(branch.track, atInEnd: branch.first, leaving: true);
-                if (IsLeftBranch(approach, branchOut))
-                    return float.PositiveInfinity;
+                if (IsLeftBranch(junctionPosition, approach, branch.track, branch.first))
+                    return RightHandCost;
             }
             return 0f;
         }
@@ -351,9 +374,9 @@ namespace DvMod.RemoteDispatch
                 if (!IsFacingChoice(from, out var junction))
                     continue;
 
+                var junctionPosition = junction!.position;
                 var approach = TangentAtEnd(from.track, atInEnd: !from.enteredViaIn, leaving: false);
-                var outward = TangentAtEnd(to.track, atInEnd: to.enteredViaIn, leaving: true);
-                var tookLeft = IsLeftBranch(approach, outward);
+                var tookLeft = IsLeftBranch(junctionPosition, approach, to.track, to.enteredViaIn);
                 if (tookLeft)
                     route.leftDivergences++;
                 else
@@ -366,10 +389,10 @@ namespace DvMod.RemoteDispatch
                 {
                     if (branch == null || branch.track == null)
                         continue;
-                    var branchOut = TangentAtEnd(branch.track, atInEnd: branch.first, leaving: true);
                     options.Add(new JObject(
                         new JProperty("track", DescribeTrack(branch.track)),
-                        new JProperty("side", IsLeftBranch(approach, branchOut) ? "left" : "right"),
+                        new JProperty("side", IsLeftBranch(junctionPosition, approach, branch.track, branch.first)
+                            ? "left" : "right"),
                         new JProperty("taken", branch.track == to.track)));
                 }
 
@@ -378,7 +401,6 @@ namespace DvMod.RemoteDispatch
                     new JProperty("to", DescribeTrack(to.track)),
                     new JProperty("took", tookLeft ? "left" : "right"),
                     new JProperty("approach", Vec(approach)),
-                    new JProperty("outward", Vec(outward)),
                     new JProperty("options", options)));
             }
         }
@@ -432,14 +454,18 @@ namespace DvMod.RemoteDispatch
 
         private static void UpdateStatus(TrainRoute route)
         {
+            // Anything already said about how the road was chosen is kept, since
+            // this used to overwrite it and hide notices entirely.
+            var notice = route.notice;
+
             route.status = route.pending.Count > 0 ? RouteStatus.Pending : RouteStatus.Active;
             var divergences = route.leftDivergences + route.rightDivergences > 0
                 ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
                 : "";
-            var prefix = route.requiresReverse ? "Route set, train propels (cars lead). " : "";
+            var prefix = notice + (route.requiresReverse ? "Route set, train propels (cars lead). " : "");
             route.message = route.pending.Count > 0
                 ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
-                : (route.requiresReverse
+                : notice + (route.requiresReverse
                     ? "Route set" + divergences + " - train propels, cars lead."
                     : "Route set" + divergences + ".");
         }
@@ -614,8 +640,20 @@ namespace DvMod.RemoteDispatch
 
             var velocity = lead.rb.velocity;
             velocity.y = 0;
-            if (velocity.sqrMagnitude < 0.25f)
-                return;   // not moving enough to tell yet
+
+            // Real motion is the best evidence; failing that the reverser is a
+            // statement of intent, and is available before the train moves.
+            Vector3 heading;
+            if (velocity.sqrMagnitude >= 0.25f)
+            {
+                heading = velocity.normalized;
+            }
+            else
+            {
+                heading = Signalling.ReverserHeading(trainset);
+                if (heading.sqrMagnitude < 0.001f)
+                    return;   // nothing to judge by yet
+            }
 
             // Where the road goes from the train's current position.
             var index = Mathf.Clamp(route.progressIndex, 0, route.pathTracks.Count - 2);
@@ -630,8 +668,8 @@ namespace DvMod.RemoteDispatch
                 return;
 
             route.directionVerified = true;
-            if (Vector3.Dot(alongRoute.normalized, velocity.normalized) >= 0f)
-                return;   // travelling the way the road was laid
+            if (Vector3.Dot(alongRoute.normalized, heading) >= 0f)
+                return;   // heading the way the road was laid
 
             Main.DebugLog(() => $"Route {route.id}: train set off opposite the booked road; re-laying.");
             Reroute(route);
@@ -707,7 +745,19 @@ namespace DvMod.RemoteDispatch
             var last = trainset.lastCar;
             var seen = new HashSet<TrackGraph.Step>();
 
-            foreach (var end in new[] { first, last })
+            // The reverser says which way the driver intends to go, so the end
+            // it points at is offered first even on a standing train.
+            var intent = Signalling.ReverserHeading(trainset);
+            var ends = new[] { first, last };
+            if (intent.sqrMagnitude > 0.001f && first != null && last != null && first != last)
+            {
+                var alongConsist = first.transform.position - last.transform.position;
+                alongConsist.y = 0;
+                if (Vector3.Dot(alongConsist, intent) < 0f)
+                    ends = new[] { last, first };
+            }
+
+            foreach (var end in ends)
             {
                 if (end == null)
                     continue;
@@ -719,7 +769,7 @@ namespace DvMod.RemoteDispatch
                 // is no "away", so both directions are offered instead.
                 var other = end == first ? last : first;
                 var away = other == null || other == end
-                    ? Vector3.zero
+                    ? intent
                     : end.transform.position - other.transform.position;
 
                 foreach (var step in StepsFrom(bogie.track, away))
