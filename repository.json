@@ -2,8 +2,8 @@
   "Releases": [
     {
       "Id": "CSARemoteDispatch",
-      "Version": "1.4.5",
-      "DownloadUrl": "https://github.com/Chairservices-Australia/CSARemoteDispatch/releases/download/v1.4.5/CSARemoteDispatch_v1.4.5.zip"
+      "Version": "1.4.6",
+      "DownloadUrl": "https://github.com/Chairservices-Australia/CSARemoteDispatch/releases/download/v1.4.6/CSARemoteDispatch_v1.4.6.zip"
     }
   ]
 }
