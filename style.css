@@ -228,37 +228,16 @@ body {
 }
 
 /* routing */
-#routingForm div {
-  margin: 4px 0;
-}
-#routingForm label {
-  display: inline-block;
-  min-width: 7em;
-}
 #routeMessage {
   font-size: 12px;
   font-style: italic;
   min-height: 1.2em;
-}
-#routeList {
-  margin-top: 8px;
-  font-size: 12px;
 }
 .routeStatus-Active { color: #2e7d32; font-weight: bold; }
 .routeStatus-Pending { color: #b8860b; font-weight: bold; }
 .routeStatus-Conflict, .routeStatus-Failed { color: #c62828; font-weight: bold; }
 .routeStatus-AwaitingReversal { color: #6a1b9a; font-weight: bold; }
 
-/* Ties a row to the road drawn in the same colour on the map. */
-.routeSwatch {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  margin-right: 5px;
-  border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, 0.35);
-  vertical-align: middle;
-}
 
 /* Route messages carry driver instructions, so they are readable in the list
    rather than only on hover. */
@@ -429,25 +408,6 @@ input[type="range"] {
 #routeSetButton:hover {
   filter: brightness(1.1);
 }
-#routeListBody button {
-  padding: 2px 8px;
-  font-size: 11px;
-  font-weight: 500;
-}
-#routeList {
-  table-layout: auto;
-}
-#routeList th,
-#routeList td {
-  overflow-wrap: anywhere;
-}
-#routeList .routeMessage {
-  color: var(--rd-text-muted);
-  background: var(--rd-panel);
-}
-#routeList .routeMessage-action {
-  color: #d5a6ff;
-}
 
 /* Loco control buttons -------------------------------------------- */
 .locoControlButton {
@@ -571,36 +531,6 @@ body.theme-dark .followControl a.followControlButton.active svg {
 /* The itinerary being built, before it is sent. Numbered because the order is
    the whole point of it, and kept tight so a full list of eight still sits in
    the panel above the road list. */
-#routeStopList {
-  margin: 6px 0;
-  padding-left: 22px;
-  font-size: 12px;
-}
-
-#routeStopList.empty {
-  display: none;
-}
-
-#routeStopList li {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 1px 0;
-}
-
-.routeStopRemove {
-  border: none;
-  background: none;
-  color: var(--rd-text-muted);
-  cursor: pointer;
-  font-size: 14px;
-  line-height: 1;
-  padding: 0 2px;
-}
-
-.routeStopRemove:hover {
-  color: var(--rd-text);
-}
 
 #routeStopHint {
   font-size: 11px;
@@ -627,8 +557,262 @@ body.theme-dark .followControl a.followControlButton.active svg {
   margin-bottom: 2px;
 }
 
-/* Sits between the aboard-a-train line and the form, and collapses to nothing
-   while there is no job to offer. */
-#routeJobActions:not(:empty) {
-  margin: 0 0 6px;
+/* ------------------------------------------------------------------ *
+ * Routing panel
+ *
+ * The itinerary is the subject of this panel, so it sits in the middle
+ * of it and is always drawn - including when it is empty, where it
+ * shows what Set route would do instead. Two buttons that each did a
+ * different thing depending on hidden state was the confusing part.
+ * ------------------------------------------------------------------ */
+.routeField {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.routeField label {
+  min-width: 3.5em;
+  font-size: 12px;
+  color: var(--rd-text-muted);
+}
+
+.routeField select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.routeSectionHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--rd-text-muted);
+  border-bottom: 1px solid var(--rd-border);
+  padding-bottom: 2px;
+}
+
+.routeSectionTools {
+  display: flex;
+  gap: 8px;
+}
+
+/* Secondary actions, kept out of the way of the one button that commits. */
+.routeLink {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--rd-accent);
+  text-decoration: underline;
+}
+
+.routeLink:hover {
+  color: var(--rd-text);
+}
+
+#routeStopList {
+  list-style: none;
+  margin: 4px 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+#routeStopList li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: var(--rd-panel-alt);
+  margin-bottom: 3px;
+  counter-increment: routeStop;
+}
+
+#routeStopList li::before {
+  content: counter(routeStop);
+  flex: 0 0 auto;
+  min-width: 1.4em;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--rd-text-muted);
+}
+
+#routeStopList {
+  counter-reset: routeStop;
+}
+
+.routeStopLabel {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+/* What Set route would do with nothing booked - shown, not implied. */
+#routeStopList li.routeStopGhost {
+  background: none;
+  border: 1px dashed var(--rd-border);
+  color: var(--rd-text-muted);
+  font-style: italic;
+}
+
+#routeStopList li.routeStopGhost::before {
+  content: "\2192";
+  font-style: normal;
+}
+
+.routeStopTools {
+  display: flex;
+  gap: 2px;
+}
+
+.routeStopTool {
+  border: none;
+  background: none;
+  color: var(--rd-text-muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.routeStopTool:hover:not(:disabled) {
+  color: var(--rd-text);
+  background: var(--rd-hover);
+}
+
+.routeStopTool:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.routeAdd {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+/* The two selects share what room there is; the button takes only its own. */
+.routeAdd select {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.routeAdd button {
+  flex: 0 0 auto;
+}
+
+.routePrimary {
+  display: block;
+  width: 100%;
+  margin: 10px 0 4px;
+  padding: 6px;
+  font-weight: 600;
+}
+
+.routePrimary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Active roads ----------------------------------------------------- *
+ * One card each, carrying the colour it is drawn in on the map twice -
+ * down the edge and in the numbered badge - and headed by whoever
+ * booked it, which is what another dispatcher needs to see first.     */
+.routeListHead {
+  margin-top: 12px;
+}
+
+#routeList {
+  font-size: 12px;
+}
+
+.routeEmpty {
+  color: var(--rd-text-muted);
+  font-style: italic;
+  padding: 6px 2px;
+}
+
+.routeCard {
+  border: 1px solid var(--rd-border);
+  border-left-width: 4px;
+  border-left-style: solid;
+  border-radius: 4px;
+  background: var(--rd-panel-alt);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+
+.routeCardHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.routeBadge {
+  flex: 0 0 auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  color: #10131a;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+}
+
+.routeOperator {
+  flex: 1 1 auto;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.routeTrain {
+  flex: 0 0 auto;
+  color: var(--rd-text-muted);
+  font-size: 11px;
+}
+
+.routeClear {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.routeCardDest {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.routeArrow {
+  color: var(--rd-text-muted);
+}
+
+.routeCard .routeStatus {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.routeCard .routeMessage {
+  margin-top: 4px;
+  padding: 0;
+  border: none;
+  color: var(--rd-text-muted);
+  background: none;
+}
+
+body.theme-dark .routeCard .routeMessage-action {
+  color: #d5a6ff;
 }

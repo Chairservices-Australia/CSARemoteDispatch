@@ -77,36 +77,37 @@
     <div class="leaflet-sidebar-pane" id="routingTab">
       <div id="routingForm">
         <div id="routeCurrentTrain">Not aboard a train.</div>
-        <div id="routeJobActions"><button id="routeUseJobButton" hidden>Use job route</button></div>
-        <div>
+
+        <div class="routeField">
           <label for="routeTrainSelect">Train</label>
           <select id="routeTrainSelect"></select>
         </div>
-        <div>
-          <label for="routeStationSelect">Station</label>
-          <select id="routeStationSelect"></select>
-        </div>
-        <div>
-          <label for="routeTrackSelect">Platform / track</label>
-          <select id="routeTrackSelect"></select>
-        </div>
-        <div>
-          <button id="routeAddStopButton">Add stop</button>
-          <button id="routeSetButton">Set route</button>
+
+        <div class="routeSectionHead">
+          <span>Calling at</span>
+          <span class="routeSectionTools">
+            <button id="routeUseJobButton" class="routeLink" hidden>use job route</button>
+            <button id="routeClearStopsButton" class="routeLink" hidden>clear</button>
+          </span>
         </div>
         <ol id="routeStopList"></ol>
-        <div id="routeStopHint">
-          Add stops to call at several places in turn. Right-click a junction on
-          the map to call at the junction itself rather than a platform.
+
+        <div class="routeSectionHead"><span>Add a stop</span></div>
+        <div class="routeAdd">
+          <select id="routeStationSelect" aria-label="Station"></select>
+          <select id="routeTrackSelect" aria-label="Platform or track"></select>
+          <button id="routeAddStopButton" title="Add this track to the itinerary">Add</button>
         </div>
+        <div id="routeStopHint">
+          Right-click a junction on the map to call at the junction itself
+          rather than a platform.
+        </div>
+
+        <button id="routeSetButton" class="routePrimary">Set route</button>
         <div id="routeMessage"></div>
       </div>
-      <table id="routeList">
-        <thead>
-          <tr><th>#</th><th>Train</th><th>Operator</th><th>To</th><th>Status</th><th></th></tr>
-        </thead>
-        <tbody id="routeListBody"></tbody>
-      </table>
+      <div class="routeSectionHead routeListHead"><span>Active roads</span></div>
+      <div id="routeList"></div>
     </div>
     <div class="leaflet-sidebar-pane" id="settingsTab">
       <table>

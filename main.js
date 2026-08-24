@@ -663,8 +663,9 @@ const routeTrainSelect = document.getElementById('routeTrainSelect');
 const routeStationSelect = document.getElementById('routeStationSelect');
 const routeTrackSelect = document.getElementById('routeTrackSelect');
 const routeMessage = document.getElementById('routeMessage');
-const routeListBody = document.getElementById('routeListBody');
+const routeList = document.getElementById('routeList');
 const routeStopList = document.getElementById('routeStopList');
+const routeSetButton = document.getElementById('routeSetButton');
 
 // The itinerary being built, before it is sent. Each entry is { id, label }:
 // the id is what the host routes to - a track ID or a junction like "J-482" -
@@ -685,6 +686,21 @@ function stopLabelFor(id) {
   return replaceHyphens(id);
 }
 
+function selectedTrackStop() {
+  const id = routeTrackSelect.value;
+  if (!id)
+    return null;
+  const option = routeTrackSelect.selectedOptions[0];
+  return { id, label: option ? option.textContent : replaceHyphens(id) };
+}
+
+/// Draw the itinerary, and keep it an honest picture of what Set route will do.
+///
+/// With nothing booked, Set route runs to whatever track is selected below.
+/// That used to be an invisible second mode - two buttons that each did a
+/// different thing depending on state. The selected track is shown here as a
+/// faint first call instead, so the list always says exactly where the train
+/// will be sent.
 function renderPlannedStops() {
   // A browser holding a cached index.html from before stops existed has no
   // list to draw into. Routing still works without it, so this gives way
@@ -692,24 +708,68 @@ function renderPlannedStops() {
   if (!routeStopList)
     return;
   routeStopList.innerHTML = '';
+
+  const clearButton = document.getElementById('routeClearStopsButton');
+  if (clearButton)
+    clearButton.hidden = plannedStops.length === 0;
+
+  if (plannedStops.length === 0) {
+    const preview = selectedTrackStop();
+    const item = document.createElement('li');
+    item.className = 'routeStopGhost';
+    item.textContent = preview
+      ? preview.label
+      : 'Nothing booked yet.';
+    routeStopList.appendChild(item);
+    if (routeSetButton)
+      routeSetButton.disabled = !preview;
+    return;
+  }
+
+  if (routeSetButton)
+    routeSetButton.disabled = false;
+
   for (const [index, stop] of plannedStops.entries()) {
     const item = document.createElement('li');
+
     const label = document.createElement('span');
+    label.className = 'routeStopLabel';
     label.textContent = stop.label;
     item.appendChild(label);
 
-    const remove = document.createElement('button');
-    remove.textContent = '×';
-    remove.title = 'Remove this stop';
-    remove.className = 'routeStopRemove';
-    remove.addEventListener('click', () => {
+    const tools = document.createElement('span');
+    tools.className = 'routeStopTools';
+    // Buttons rather than dragging: the panel is narrow, this has to work on a
+    // phone propped on the desk, and an order of calls is short enough that
+    // nudging one along is no hardship.
+    tools.appendChild(stopButton('↑', 'Move earlier', index === 0, () => {
+      [plannedStops[index - 1], plannedStops[index]] =
+        [plannedStops[index], plannedStops[index - 1]];
+      renderPlannedStops();
+    }));
+    tools.appendChild(stopButton('↓', 'Move later',
+      index === plannedStops.length - 1, () => {
+        [plannedStops[index + 1], plannedStops[index]] =
+          [plannedStops[index], plannedStops[index + 1]];
+        renderPlannedStops();
+      }));
+    tools.appendChild(stopButton('×', 'Remove this call', false, () => {
       plannedStops.splice(index, 1);
       renderPlannedStops();
-    });
-    item.appendChild(remove);
+    }));
+    item.appendChild(tools);
     routeStopList.appendChild(item);
   }
-  routeStopList.classList.toggle('empty', plannedStops.length === 0);
+}
+
+function stopButton(glyph, title, disabled, onClick) {
+  const button = document.createElement('button');
+  button.className = 'routeStopTool';
+  button.textContent = glyph;
+  button.title = title;
+  button.disabled = disabled;
+  button.addEventListener('click', onClick);
+  return button;
 }
 
 // Calling twice at the same place in a row is a leg of no length, which would
@@ -723,14 +783,14 @@ function addPlannedStop(id, label) {
   }
   const last = plannedStops[plannedStops.length - 1];
   if (last && last.id === id) {
-    routeMessage.textContent = `${label} is already the last stop.`;
+    routeMessage.textContent = `${label} is already the last call.`;
     return;
   }
   plannedStops.push({ id, label });
   renderPlannedStops();
   routeMessage.textContent = plannedStops.length === 1
-    ? `Stop added. Add more, or press Set route.`
-    : `${plannedStops.length} stops booked.`;
+    ? 'One call booked. Add more, or press Set route.'
+    : `${plannedStops.length} calls booked.`;
 }
 
 function fillSelect(select, entries, keepValue) {
@@ -787,9 +847,16 @@ function updateRouteTrackList() {
       : [track.id, track.display || track.id])
     .sort((a, b) => a[1].localeCompare(b[1]));
   fillSelect(routeTrackSelect, entries, true);
+  renderPlannedStops();
 }
 
-routeStationSelect.addEventListener('input', updateRouteTrackList);
+routeStationSelect.addEventListener('input', () => {
+  updateRouteTrackList();
+  renderPlannedStops();
+});
+
+// Keeps the faint first call under "Calling at" honest as the selection moves.
+routeTrackSelect.addEventListener('input', renderPlannedStops);
 
 // Bright green over the booked road, so where a train is going reads at a
 // glance without tracing junctions by eye.
@@ -868,72 +935,101 @@ function applyRouteHighlight(routes) {
     repaintJunction(junctionId);
 }
 
-function appendCell(row, text) {
-  const cell = document.createElement('td');
-  cell.textContent = text;
-  row.appendChild(cell);
-  return cell;
-}
-
+/// One card per road, keyed to the colour it is drawn in on the map and
+/// headed by whoever booked it.
+///
+/// This was a six-column table in a sidebar four inches wide, where the
+/// operator was a cramped column and the colour a dot that took some finding.
+/// The card carries the colour twice - as the stripe down its edge and as the
+/// numbered badge - and gives the name that booked it top billing, which is
+/// what a second dispatcher needs to see at a glance.
 function renderRoutes(routes) {
   applyRouteHighlight(routes);
-  routeListBody.innerHTML = '';
-  for (const route of routes) {
-    const row = document.createElement('tr');
+  routeList.innerHTML = '';
 
-    // The swatch is what ties a row to the coloured road on the map, and the
-    // number says where it came in the order.
-    const marker = document.createElement('td');
-    const dot = document.createElement('span');
-    dot.className = 'routeSwatch';
-    dot.style.backgroundColor = routeColor(route);
-    marker.appendChild(dot);
-    marker.appendChild(document.createTextNode(String(routeOrder(route))));
-    marker.title = 'Roads are numbered and coloured in the order they were set.';
-    row.appendChild(marker);
+  const live = routes.filter(route => route.status !== 'Cleared');
+  if (live.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'routeEmpty';
+    empty.textContent = 'No roads set.';
+    routeList.appendChild(empty);
+    return;
+  }
 
-    appendCell(row, route.trainsetId);
-    appendCell(row, route.requestedBy || 'Local');
+  for (const route of live) {
+    const color = routeColor(route);
+    const card = document.createElement('div');
+    card.className = 'routeCard';
+    card.style.borderLeftColor = color;
 
-    // A road calling at several places shows where it is going now and how far
-    // through the itinerary that is, since only the leg in hand is on the map.
+    const head = document.createElement('div');
+    head.className = 'routeCardHead';
+
+    const badge = document.createElement('span');
+    badge.className = 'routeBadge';
+    badge.style.backgroundColor = color;
+    badge.textContent = String(routeOrder(route));
+    badge.title = 'Roads are numbered and coloured in the order they were set.';
+    head.appendChild(badge);
+
+    const who = document.createElement('span');
+    who.className = 'routeOperator';
+    who.textContent = route.requestedBy || 'Local';
+    head.appendChild(who);
+
+    const train = document.createElement('span');
+    train.className = 'routeTrain';
+    train.textContent = `train ${route.trainsetId}`;
+    head.appendChild(train);
+
+    const clear = document.createElement('button');
+    clear.className = 'routeClear';
+    clear.textContent = 'Clear';
+    clear.title = 'Release this road and its junctions';
+    clear.addEventListener('click', () => clearRoute(route.id));
+    head.appendChild(clear);
+    card.appendChild(head);
+
+    // Where it is going now, and how far through the booking that is: only the
+    // leg in hand is ever drawn on the map.
     const stops = Array.isArray(route.stops) ? route.stops : [];
-    const destination = appendCell(row, stopLabelFor(route.destinationTrack));
+    const dest = document.createElement('div');
+    dest.className = 'routeCardDest';
+    const arrow = document.createElement('span');
+    arrow.className = 'routeArrow';
+    arrow.textContent = '→ ';
+    dest.appendChild(arrow);
+    dest.appendChild(document.createTextNode(stopLabelFor(route.destinationTrack)));
     if (stops.length > 1) {
       const progress = document.createElement('span');
       progress.className = 'routeStopProgress';
-      progress.textContent = ` ${(route.stopIndex || 0) + 1}/${stops.length}`;
-      destination.appendChild(progress);
-      destination.title = 'Calling at ' + stops.map(stopLabelFor).join(', ');
+      progress.textContent = ` call ${(route.stopIndex || 0) + 1} of ${stops.length}`;
+      dest.appendChild(progress);
+      // Built as text, not interpolated markup: track names come from the
+      // world and from other mods, and a quote in one used to break out of the
+      // title attribute.
+      dest.title = 'Calling at ' + stops.map(stopLabelFor).join(', ');
     }
-    // Built as text rather than interpolated markup: track and signal names
-    // come from the world and from other mods, and a quote in one of them used
-    // to break out of the title attribute.
-    const status = appendCell(row, route.status);
-    status.className = `routeStatus routeStatus-${route.status}`;
-    status.title = route.message || '';
+    card.appendChild(dest);
 
-    const actions = document.createElement('td');
-    const clear = document.createElement('button');
-    clear.textContent = 'Clear';
-    clear.addEventListener('click', () => clearRoute(route.id));
-    actions.appendChild(clear);
-    row.appendChild(actions);
-    routeListBody.appendChild(row);
+    const status = document.createElement('div');
+    status.className = `routeStatus routeStatus-${route.status}`;
+    status.textContent = route.status === 'AwaitingReversal'
+      ? 'Awaiting reversal' : route.status;
+    card.appendChild(status);
 
     // Some of these are instructions the driver has to act on - draw forward
     // past a signal and set back, or stand short of a crossing until it clears
-    // - so they belong in the list, not hidden in a tooltip.
+    // - so they belong on the card, not hidden in a tooltip.
     if (route.message) {
-      const note = document.createElement('tr');
-      const cell = document.createElement('td');
-      cell.colSpan = 6;
-      cell.className = 'routeMessage'
+      const note = document.createElement('div');
+      note.className = 'routeMessage'
         + (route.status === 'AwaitingReversal' ? ' routeMessage-action' : '');
-      cell.textContent = route.message;
-      note.appendChild(cell);
-      routeListBody.appendChild(note);
+      note.textContent = route.message;
+      card.appendChild(note);
     }
+
+    routeList.appendChild(card);
   }
 }
 
@@ -966,8 +1062,8 @@ function updateUseJobButton() {
     return;
   button.hidden = autoJobStops.length === 0;
   button.textContent = autoJobStops.length > 1
-    ? `Use job route (${autoJobStops.length} stops)`
-    : 'Use job route';
+    ? `use job route (${autoJobStops.length} calls)`
+    : 'use job route';
 }
 
 function selectStationForTrack(trackDisplayId) {
@@ -983,6 +1079,9 @@ function selectStationForTrack(trackDisplayId) {
     for (const option of routeTrackSelect.options) {
       if (option.value === wanted) {
         routeTrackSelect.value = wanted;
+        // The preview under "Calling at" follows the selection, and this moved
+        // it without going through the change event that normally redraws it.
+        renderPlannedStops();
         return true;
       }
     }
@@ -1072,27 +1171,40 @@ if (routeUseJobButton) {
   });
 }
 
+const routeClearStopsButton = document.getElementById('routeClearStopsButton');
+if (routeClearStopsButton) {
+  routeClearStopsButton.addEventListener('click', () => {
+    plannedStops = [];
+    renderPlannedStops();
+    routeMessage.textContent = '';
+  });
+}
+
 document.getElementById('routeAddStopButton')
   .addEventListener('click', () => {
-    const trackId = routeTrackSelect.value;
-    if (!trackId) {
-      routeMessage.textContent = 'Select a track to add as a stop.';
+    const stop = selectedTrackStop();
+    if (!stop) {
+      routeMessage.textContent = 'Choose a station and a track first.';
       return;
     }
-    const option = routeTrackSelect.selectedOptions[0];
-    addPlannedStop(trackId, option ? option.textContent : replaceHyphens(trackId));
+    addPlannedStop(stop.id, stop.label);
   });
 
-document.getElementById('routeSetButton')
+routeSetButton
   .addEventListener('click', () => {
     const trainsetId = routeTrainSelect.value;
-    // With nothing booked the selected track is the whole road, so choosing a
-    // destination and pressing Set route still needs no extra step.
+    // With nothing booked the selected track is the whole road - which the
+    // list shows as a faint first call, so this is not a hidden second mode.
+    const preview = selectedTrackStop();
     const stops = plannedStops.length > 0
       ? plannedStops.map(stop => stop.id)
-      : [routeTrackSelect.value].filter(Boolean);
-    if (!trainsetId || stops.length === 0) {
-      routeMessage.textContent = 'Select a train and a destination track.';
+      : (preview ? [preview.id] : []);
+    if (!trainsetId) {
+      routeMessage.textContent = 'Choose a train first.';
+      return;
+    }
+    if (stops.length === 0) {
+      routeMessage.textContent = 'Add a call, or choose a track to run to.';
       return;
     }
     routeMessage.textContent = 'Planning...';

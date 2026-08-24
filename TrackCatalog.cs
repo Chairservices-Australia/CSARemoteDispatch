@@ -12,18 +12,11 @@ namespace DvMod.RemoteDispatch
     /// route request that named eight stops did it nine times over. The result
     /// was a hitch whenever a page loaded or a road was laid.
     ///
-    /// The rail network does not change while the world is loaded, so the scan
-    /// happens once and the answer is kept. What can change is what has streamed
-    /// in - a mod may register track after the first scan - so a lookup that
-    /// misses rescans, no more often than RescanSeconds, and everything that
-    /// caches a derived answer hangs it off Version.
+    /// The rail network does not change after world loading finishes, so the
+    /// scan happens once and the answer is kept. Everything that caches a
+    /// derived answer hangs it off Version and is invalidated on world unload.
     public static class TrackCatalog
     {
-        /// The least time between scans forced by a lookup that found nothing.
-        /// Without it, one request for a track that genuinely does not exist
-        /// would put a world scan behind every lookup that followed.
-        private const float RescanSeconds = 10f;
-
         private static readonly RailTrack[] NoTracks = new RailTrack[0];
         private static readonly List<RailTrack> NoMatches = new List<RailTrack>();
 
@@ -31,7 +24,6 @@ namespace DvMod.RemoteDispatch
         private static readonly Dictionary<string, List<RailTrack>> tracksById =
             new Dictionary<string, List<RailTrack>>();
         private static bool built;
-        private static float lastScanTime = float.NegativeInfinity;
 
         /// Bumped whenever the scan produced a different set of tracks. Anything
         /// derived from the network - the map's geometry, the station list -
@@ -60,21 +52,15 @@ namespace DvMod.RemoteDispatch
             if (tracksById.TryGetValue(id, out var found))
                 return found;
 
-            // A miss can mean track has streamed in since the scan. Rescanning
-            // is worth one attempt, but not once per lookup.
-            if (Time.time - lastScanTime < RescanSeconds)
-                return NoMatches;
-            Rebuild();
-            return tracksById.TryGetValue(id, out found) ? found : NoMatches;
+            return NoMatches;
         }
 
-        /// Pick up track registered since the last scan, if it has been long
-        /// enough to be worth looking. For callers that produce a whole view of
-        /// the network and would otherwise never notice a modded yard.
+        /// Ensure the catalogue exists. The rail network is fixed once world
+        /// loading finishes; periodically searching every Unity object for a
+        /// possible addition caused large hitches during ordinary play.
         public static void RefreshIfStale()
         {
-            if (!built || Time.time - lastScanTime >= RescanSeconds)
-                Rebuild();
+            EnsureBuilt();
         }
 
         /// Drop everything, so the next use scans afresh. Called when the world
@@ -84,7 +70,6 @@ namespace DvMod.RemoteDispatch
             tracks = NoTracks;
             tracksById.Clear();
             built = false;
-            lastScanTime = float.NegativeInfinity;
             Version++;
         }
 
@@ -97,7 +82,6 @@ namespace DvMod.RemoteDispatch
         private static void Rebuild()
         {
             built = true;
-            lastScanTime = Time.time;
 
             var found = Component.FindObjectsOfType<RailTrack>();
             // The count is what says the network changed. Comparing the arrays

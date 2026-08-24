@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace DvMod.RemoteDispatch
 {
@@ -21,6 +22,22 @@ namespace DvMod.RemoteDispatch
             StartCoroutine(DeferredEventsCoro());
             StartCoroutine(Routing.RetryPendingCoroutine());
             StartCoroutine(SpeedSigns.DiscoveryCoroutine());
+            SceneManager.sceneLoaded += OnSceneLoaded;
+            SceneManager.sceneUnloaded += OnSceneUnloaded;
+            for (var i = 0; i < SceneManager.sceneCount; i++)
+                SpeedSigns.QueueScene(SceneManager.GetSceneAt(i));
+        }
+
+        private static void OnSceneLoaded(Scene scene, LoadSceneMode mode) =>
+            SpeedSigns.QueueScene(scene);
+
+        private static void OnSceneUnloaded(Scene scene) =>
+            SpeedSigns.ForgetScene(scene);
+
+        private void OnDestroy()
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+            SceneManager.sceneUnloaded -= OnSceneUnloaded;
         }
 
         private static GameObject? rootObject;

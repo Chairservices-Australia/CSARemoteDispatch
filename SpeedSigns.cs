@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Linq;
 using DV.Signs;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace DvMod.RemoteDispatch
 {
@@ -101,16 +102,8 @@ namespace DvMod.RemoteDispatch
         private static readonly Dictionary<Vector2Int, List<RailTrack>> trackGrid =
             new Dictionary<Vector2Int, List<RailTrack>>();
 
-        private static Vector3 lastScanPosition;
-        private static bool scannedOnce;
-        private static float nextForcedScanTime;
-
-        /// The interval currently used for a scan that nothing else asked for.
-        /// Backed off while scans keep finding nothing, so standing still in
-        /// country already covered does not cost a world scan every minute.
-        private static float forcedRescanSeconds = ForcedRescanSeconds;
-        private static float nextTrackGridRebuildTime;
-        private static int unmatchedSinceGridBuild;
+        private static readonly Queue<Scene> scenesToScan = new Queue<Scene>();
+        private static readonly HashSet<int> queuedScenes = new HashSet<int>();
 
         public static int KnownCount => known.Count;
 
@@ -144,57 +137,47 @@ namespace DvMod.RemoteDispatch
             unplaceable.Clear();
             trainStates.Clear();
             trackGrid.Clear();
-            lastScanPosition = Vector3.zero;
-            scannedOnce = false;
-            nextForcedScanTime = 0f;
-            forcedRescanSeconds = ForcedRescanSeconds;
-            nextTrackGridRebuildTime = 0f;
-            unmatchedSinceGridBuild = 0;
+            scenesToScan.Clear();
+            queuedScenes.Clear();
         }
 
-        /// Sign discovery, spread across frames and paced by how far the player
-        /// has actually travelled.
+        /// Arrange to inspect a scene after Unity has finished loading it. The
+        /// scene handle prevents the initial enumeration and sceneLoaded from
+        /// queuing the same scene twice.
+        public static void QueueScene(Scene scene)
+        {
+            if (!scene.IsValid() || !scene.isLoaded || !queuedScenes.Add(scene.handle))
+                return;
+            scenesToScan.Enqueue(scene);
+        }
+
+        public static void ForgetScene(Scene scene) => queuedScenes.Remove(scene.handle);
+
+        /// Sign discovery, spread across frames as scenes stream in.
         ///
-        /// Signs are baked into the world and stream in with it, and the game
-        /// offers no hook for their arrival, so they still have to be looked
-        /// for. Doing that on a fixed timer meant a world-wide scan every few
-        /// seconds whether or not anything had changed, which is felt as a
-        /// regular hitch. This waits until there is new ground to cover, then
-        /// works through the results a slice at a time so no single frame
-        /// carries the whole pass.
+        /// FindObjectsOfType performs its entire world walk synchronously before
+        /// returning, so processing its result in slices did not prevent the
+        /// several-second hitch caused by the walk itself. Scene loading is the
+        /// arrival notification: traverse only that scene's hierarchy, yielding
+        /// regularly, and register each SignGeneratorData component in place.
         public static IEnumerator DiscoveryCoroutine()
         {
-            var poll = WaitFor.Seconds(PollSeconds);
             while (true)
             {
-                yield return poll;
+                if (scenesToScan.Count == 0)
+                {
+                    yield return null;
+                    continue;
+                }
 
-                if (!TryGetScanOrigin(out var origin) || !IsScanDue(origin))
+                var scene = scenesToScan.Dequeue();
+                if (!scene.IsValid() || !scene.isLoaded)
                     continue;
 
-                scannedOnce = true;
-                lastScanPosition = origin;
-                // Set before the work, not after, so a pass spread over several
-                // frames cannot immediately ask for another.
-                nextForcedScanTime = Time.time + forcedRescanSeconds;
-                var knownBefore = known.Count;
-
-                // The rail network is effectively static, so the grid is built
-                // once. It is only reconsidered when a pass found signs that no
-                // known track could claim, which is what a newly streamed-in
-                // piece of railway would look like.
-                if (trackGrid.Count == 0
-                    || (unmatchedSinceGridBuild > 0 && Time.time >= nextTrackGridRebuildTime))
+                if (trackGrid.Count == 0)
                 {
-                    // A rebuild is triggered by signs no known track could
-                    // claim, which is what newly streamed-in railway looks
-                    // like, so this is the moment to look for it.
                     TrackCatalog.RefreshIfStale();
                     var tracks = TrackCatalog.All;
-                    trackGrid.Clear();
-                    unplaceable.Clear();
-                    unmatchedSinceGridBuild = 0;
-                    nextTrackGridRebuildTime = Time.time + TrackGridMinRebuildSeconds;
                     for (var i = 0; i < tracks.Length; i++)
                     {
                         AddTrackToGrid(tracks[i]);
@@ -203,54 +186,25 @@ namespace DvMod.RemoteDispatch
                     }
                 }
 
-                var data = UnityEngine.Object.FindObjectsOfType<SignGeneratorData>();
-                for (var i = 0; i < data.Length; i++)
+                var pending = new Stack<Transform>();
+                foreach (var root in scene.GetRootGameObjects())
+                    pending.Push(root.transform);
+
+                var visited = 0;
+                while (pending.Count > 0)
                 {
-                    RegisterSigns(data[i]);
-                    if ((i + 1) % SignComponentsPerFrame == 0)
+                    var transform = pending.Pop();
+                    if (transform == null)
+                        continue;
+                    var data = transform.GetComponent<SignGeneratorData>();
+                    if (data != null)
+                        RegisterSigns(data);
+                    for (var i = 0; i < transform.childCount; i++)
+                        pending.Push(transform.GetChild(i));
+                    if (++visited % SceneObjectsPerFrame == 0)
                         yield return null;
                 }
-
-                // Finding every object of a type is one of the most expensive
-                // things Unity offers and cannot be spread over frames, so a
-                // pass that turns nothing up is a hitch bought for nothing.
-                // Travelling still triggers a scan on its own; this is only the
-                // backstop for signs streaming in where the player already is,
-                // so it gives ground as it keeps finding none and returns to
-                // the short interval the moment a scan pays off.
-                forcedRescanSeconds = known.Count != knownBefore
-                    ? ForcedRescanSeconds
-                    : Mathf.Min(forcedRescanSeconds * 2f, MaxForcedRescanSeconds);
-                nextForcedScanTime = Time.time + forcedRescanSeconds;
             }
-        }
-
-        private static bool IsScanDue(Vector3 origin)
-        {
-            if (!scannedOnce)
-                return true;
-            if (Time.time >= nextForcedScanTime)
-                return true;
-            return (origin - lastScanPosition).sqrMagnitude
-                > RescanDistanceMeters * RescanDistanceMeters;
-        }
-
-        private static bool TryGetScanOrigin(out Vector3 origin)
-        {
-            var car = PlayerManager.Car;
-            if (car != null)
-            {
-                origin = car.transform.position;
-                return true;
-            }
-            var player = PlayerManager.PlayerTransform;
-            if (player != null)
-            {
-                origin = player.position;
-                return true;
-            }
-            origin = Vector3.zero;
-            return false;
         }
 
         private static void RegisterSigns(SignGeneratorData data)
@@ -278,7 +232,6 @@ namespace DvMod.RemoteDispatch
                     out var track, out var trackPosition))
                 {
                     unplaceable.Add(key);
-                    unmatchedSinceGridBuild++;
                     continue;
                 }
 
@@ -472,27 +425,9 @@ namespace DvMod.RemoteDispatch
         private const float CrossingToleranceMeters = 0.1f;
         private const int CurveSamples = 32;
 
-        /// How often the coroutine looks at whether a pass is warranted. Cheap:
-        /// it only compares the player's position against the last one scanned.
-        private const float PollSeconds = 1f;
-
-        /// New ground that has to be covered before signs are looked for again.
-        private const float RescanDistanceMeters = 150f;
-
-        /// A floor, so a player who never moves far still picks up signs that
-        /// streamed in around them.
-        private const float ForcedRescanSeconds = 60f;
-
-        /// The longest the backstop scan is allowed to stretch to.
-        private const float MaxForcedRescanSeconds = 480f;
-
-        /// The soonest the track grid may be built a second time, however many
-        /// signs go unplaced in the meantime.
-        private const float TrackGridMinRebuildSeconds = 120f;
-
         // Work carried by a single frame during a pass.
         private const int TracksPerFrame = 96;
-        private const int SignComponentsPerFrame = 192;
+        private const int SceneObjectsPerFrame = 192;
 
         private static void AddTrackToGrid(RailTrack track)
         {
