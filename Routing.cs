@@ -660,13 +660,18 @@ namespace DvMod.RemoteDispatch
             var chosen = candidates[0];
             var shortestLength = float.MaxValue;
             var bestRouteCost = float.MaxValue;
+            var chosenAgreesWithIntent = false;
 
             // Every connected track is traversable, including tracks belonging
             // to intermediate stations and yards. The selected destination is
             // the only terminal condition. Distance remains the main cost, with
             // a small right-hand penalty so parallel and near-equivalent roads
-            // settle onto the left without sending trains on large detours, and
-            // a heavy one on leaving by the end the reverser is not pointed at.
+            // settle onto the left without sending trains on large detours.
+            // Direction is deliberately not another distance penalty: if a
+            // through road exists out of the end the reverser points toward, it
+            // wins before distance is considered. A long forward loop is still
+            // easier to drive than propelling the whole train over a shorter
+            // road, and no finite penalty can express that rule reliably.
             foreach (var candidate in candidates)
             {
                 var found = TrackGraph.FindPath(candidate, goals,
@@ -674,15 +679,19 @@ namespace DvMod.RemoteDispatch
                 if (found == null)
                     continue;
                 var length = PathLength(found);
-                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters
-                    + (AgreesWithIntent(candidate, intent) ? 0f : WrongEndPenaltyMeters);
-                if (path == null || routeCost < bestRouteCost
-                    || (Mathf.Approximately(routeCost, bestRouteCost) && length < shortestLength))
+                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters;
+                var agrees = AgreesWithIntent(candidate, intent);
+                if (path == null
+                    || (agrees && !chosenAgreesWithIntent)
+                    || (agrees == chosenAgreesWithIntent && (routeCost < bestRouteCost
+                        || (Mathf.Approximately(routeCost, bestRouteCost)
+                            && length < shortestLength))))
                 {
                     path = found;
                     chosen = candidate;
                     shortestLength = length;
                     bestRouteCost = routeCost;
+                    chosenAgreesWithIntent = agrees;
                 }
             }
 
@@ -698,7 +707,12 @@ namespace DvMod.RemoteDispatch
             // changing ends, so a direct road already inside that is the answer
             // and the search below - which is the most expensive thing this mod
             // does - is not worth starting.
+            // A reversal is only an alternative when no through road leaves in
+            // the requested direction. Once a forward through road exists, it
+            // remains preferable even when a draw-forward-and-set-back move or
+            // a backwards departure would be shorter.
             var reversal = allowReversal && reversalStartClear
+                    && !chosenAgreesWithIntent
                     && bestRouteCost > ReversalPenaltyMeters
                 ? PlanReversal(
                     candidates, goals, ConsistLength(trainset), IsBlocked, bestRouteCost, intent)
@@ -781,20 +795,9 @@ namespace DvMod.RemoteDispatch
         /// road is still the better move.
         private const float ReversalPenaltyMeters = 800f;
 
-        /// What it costs to send a train out of the end its reverser is not
-        /// pointed at, in the same currency.
-        ///
-        /// Deliberately the price of a reversal, because to the driver that is
-        /// exactly what it is: a road out of the other end is one they have to
-        /// change ends to run. Set at the same figure, a road going the way the
-        /// reverser is set wins every near-equal contest, and the reversal
-        /// search below - which produces a proper draw-forward-and-set-back
-        /// instruction rather than a silent about-turn - gets a fair look at
-        /// the cases where it does not.
-        ///
-        /// A penalty and not a veto. Where the only road to a place runs out of
-        /// the other end and no reversal can be planned, the train is still
-        /// given it rather than told there is no way there.
+        /// A reversal plan should itself begin in the commanded direction when
+        /// possible. This only ranks fallback reversing moves; it is never used
+        /// to let a backwards departure beat a forward through road.
         private const float WrongEndPenaltyMeters = ReversalPenaltyMeters;
 
         /// Which way the driver means to go: the reverser where it is set, and
@@ -856,10 +859,6 @@ namespace DvMod.RemoteDispatch
             public float inboundMeters;
             public float runOutMeters;
 
-            /// Charged when the run out itself leaves by the end the reverser is
-            /// not pointed at. The outbound leg is the one the driver runs
-            /// first, so a reversal that starts by going the wrong way is no
-            /// better than a through road that does.
             public float startPenalty;
 
             public float Cost =>
