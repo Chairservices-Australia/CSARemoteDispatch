@@ -704,6 +704,12 @@ const stationsReady = fetchJson(new URL('/station', location))
     for (const station of sorted) {
       stationMarkers.set(station.yardId, createStationLabel(station));
       stationTracks.set(station.yardId, station.tracks || []);
+      for (const track of station.tracks || []) {
+        if (typeof track === 'string')
+          trackLabels.set(track, track);
+        else if (track.id)
+          trackLabels.set(track.id, track.display || track.id);
+      }
     }
     applyStationLabelVisibility();
     fillSelect(
@@ -723,6 +729,12 @@ document.getElementById('stationLabelsCheckbox')
 // routing
 
 const stationTracks = new Map();   // yardId -> [trackId]
+
+// Canonical track ID -> the display ID the selects show ("GF-D5I"), which is
+// also what the game prints on jobs and lineside. A road loaded back into the
+// planner then names its calls exactly as the dispatcher picked them, rather
+// than showing raw IDs for the very same places.
+const trackLabels = new Map();
 const routeTrainSelect = document.getElementById('routeTrainSelect');
 const routeStationSelect = document.getElementById('routeStationSelect');
 const routeTrackSelect = document.getElementById('routeTrackSelect');
@@ -739,6 +751,58 @@ const routeSetButton = document.getElementById('routeSetButton');
 const maxStops = 12;   // matches RouteDestination.MaxStops on the host
 let plannedStops = [];
 
+// The road being amended, if any.
+//
+// While this is held, the primary button updates that road instead of booking
+// another, and says so. Editing used to live entirely in one line of message
+// text, which the next click wrote over: from then on the panel looked exactly
+// like building a new road, and the only way to find out which it would do was
+// to press it.
+let editing = null;            // { id, order, trainsetId, guid, color }
+let stopsBeforeEdit = [];      // what was on the workbench, to put back on cancel
+let trainBeforeEdit = null;
+
+const routeEditingBar = document.getElementById('routeEditing');
+const routeEditingLabel = document.getElementById('routeEditingLabel');
+
+function renderEditing() {
+  if (routeEditingBar) {
+    routeEditingBar.hidden = editing === null;
+    if (editing) {
+      routeEditingBar.style.borderLeftColor = editing.color;
+      if (routeEditingLabel) {
+        routeEditingLabel.textContent =
+          `Amending road ${editing.order}, train ${editing.trainsetId}`;
+      }
+    }
+  }
+  if (routeSetButton)
+    routeSetButton.textContent = editing ? `Update road ${editing.order}` : 'Set route';
+}
+
+/// Leave editing without putting anything back: the amendment went through.
+function stopEditing() {
+  editing = null;
+  stopsBeforeEdit = [];
+  trainBeforeEdit = null;
+}
+
+/// Leave editing and undo it, so cancel really is a cancel - the workbench
+/// goes back to whatever was on it before Edit was pressed, train included.
+function cancelEdit(message) {
+  if (!editing)
+    return;
+  const restored = stopsBeforeEdit.slice();
+  const train = trainBeforeEdit;
+  stopEditing();
+  plannedStops = restored;
+  if (train !== null
+      && Array.from(routeTrainSelect.options).some(option => option.value === train))
+    routeTrainSelect.value = train;
+  renderPlannedStops();
+  routeMessage.textContent = message || 'Left that road as it was.';
+}
+
 function stopLabelFor(id) {
   if (!id)
     return '';
@@ -747,7 +811,7 @@ function stopLabelFor(id) {
     return planned.label;
   if (/^J-\d+$/.test(id))
     return `Junction ${id.slice(2)}`;
-  return replaceHyphens(id);
+  return trackLabels.get(id) || replaceHyphens(id);
 }
 
 function selectedTrackStop() {
@@ -787,11 +851,15 @@ function renderPlannedStops() {
     routeStopList.appendChild(item);
     if (routeSetButton)
       routeSetButton.disabled = !preview;
+    renderEditing();
     return;
   }
 
   if (routeSetButton)
     routeSetButton.disabled = false;
+
+  // Read once for the whole list: every row offers to become this.
+  const selected = selectedTrackStop();
 
   for (const [index, stop] of plannedStops.entries()) {
     const item = document.createElement('li');
@@ -803,6 +871,20 @@ function renderPlannedStops() {
 
     const tools = document.createElement('span');
     tools.className = 'routeStopTools';
+
+    // Swapping one call for another is the commonest amendment there is -
+    // same road, different platform - and there was no way to do it. It meant
+    // removing the call, adding the new one, which lands at the end, and then
+    // nudging it back up past every call that came after it.
+    tools.appendChild(stopButton('\u21c4', selected
+      ? `Call here at ${selected.label} instead`
+      : 'Choose a track below to put here instead',
+      !selected || selected.id === stop.id, () => {
+        plannedStops[index] = { id: selected.id, label: selected.label };
+        renderPlannedStops();
+        routeMessage.textContent = `Call ${index + 1} is now ${selected.label}.`;
+      }));
+
     // Buttons rather than dragging: the panel is narrow, this has to work on a
     // phone propped on the desk, and an order of calls is short enough that
     // nudging one along is no hardship.
@@ -824,6 +906,7 @@ function renderPlannedStops() {
     item.appendChild(tools);
     routeStopList.appendChild(item);
   }
+  renderEditing();
 }
 
 function stopButton(glyph, title, disabled, onClick) {
@@ -1012,6 +1095,19 @@ function renderRoutes(routes) {
   routeList.innerHTML = '';
 
   const live = routes.filter(route => route.status !== 'Cleared');
+
+  // A road that has been cleared, or has run its course, is not there to amend
+  // any more. Left alone the bar went on offering to update it, and the button
+  // would have quietly booked a new road under its name. The calls stay on the
+  // workbench - they are still what was wanted, and can be booked afresh.
+  if (editing && !live.some(entry => entry.id === editing.id)) {
+    const order = editing.order;
+    stopEditing();
+    renderPlannedStops();
+    routeMessage.textContent = `Road ${order} is no longer set:`
+      + ' this will book a new road for the train chosen.';
+  }
+
   if (live.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'routeEmpty';
@@ -1117,6 +1213,14 @@ function renderRoutes(routes) {
 /// somewhere it needs sending again, and a road amended mid-journey should
 /// carry on from where the train actually is.
 function editRoute(route) {
+  // Remember the workbench as it stands, but only on the way in: pressing Edit
+  // on a second road while already editing a first should not make cancel put
+  // the first road's calls back as though they were the dispatcher's own.
+  if (!editing) {
+    stopsBeforeEdit = plannedStops.slice();
+    trainBeforeEdit = routeTrainSelect.value;
+  }
+
   const guid = guidForTrainset(route.trainsetId);
   if (guid)
     routeTrainSelect.value = guid;
@@ -1126,14 +1230,43 @@ function editRoute(route) {
 
   const stops = Array.isArray(route.stops) ? route.stops : [];
   const remaining = stops.slice(route.stopIndex || 0);
+  // Emptied first so the calls are named from the track list rather than from
+  // whatever happened to be on the workbench a moment ago.
+  plannedStops = [];
   plannedStops = remaining.map(id => ({ id, label: stopLabelFor(id) }));
+
+  editing = {
+    id: route.id,
+    order: routeOrder(route),
+    trainsetId: route.trainsetId,
+    guid,
+    color: routeColor(route),
+  };
   renderPlannedStops();
   routeMessage.textContent = plannedStops.length > 0
-    ? `Editing road ${routeOrder(route)}. Change the calls, then press Set route.`
-    : 'That road has no calls left to change.';
+    ? 'Change the calls below, then press Update.'
+    : 'That road has no calls left. Add one, or cancel.';
   if (!guid)
     routeMessage.textContent += ' Its train is no longer listed - choose one.';
 }
+
+if (routeEditingBar) {
+  document.getElementById('routeEditCancelButton')
+    .addEventListener('click', () => cancelEdit());
+}
+
+// Amending road 3 and then picking a different train is not an amendment any
+// more. The calls stay on the workbench - they are still what was wanted - but
+// this books a new road now, and the button has to stop claiming otherwise.
+routeTrainSelect.addEventListener('input', () => {
+  if (!editing || (editing.guid && routeTrainSelect.value === editing.guid))
+    return;
+  const order = editing.order;
+  stopEditing();
+  renderPlannedStops();
+  routeMessage.textContent = `No longer amending road ${order}:`
+    + ' this will book a new road for the train now chosen.';
+});
 
 function guidForTrainset(trainsetId) {
   // Prefer a locomotive, since that is how the train list names a consist.
@@ -1328,6 +1461,16 @@ routeSetButton
     fetchJson(new URL(`/route/${trainsetId}/${itinerary}`, location), { method: 'POST', body: '' })
       .then(route => {
         routeMessage.textContent = route.message || route.status;
+        // A road that would not plan leaves the itinerary where it is. Clearing
+        // it whatever came back threw away everything just built at the one
+        // moment it was needed most - to change a call and try again. The host
+        // keeps the old road on a failure to match, so an amendment that will
+        // not plan costs the train nothing.
+        if (route.status === 'Failed') {
+          refreshRoutes();
+          return;
+        }
+        stopEditing();
         plannedStops = [];
         renderPlannedStops();
         refreshRoutes();

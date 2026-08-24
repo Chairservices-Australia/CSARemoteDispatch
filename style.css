@@ -603,6 +603,35 @@ body.theme-dark .followControl a.followControlButton.active svg {
   gap: 8px;
 }
 
+/* Amending a booked road.
+ *
+ * A bar that stays put, not a line in the message area underneath: that gets
+ * written over by the next thing the dispatcher does, so the one fact they
+ * need throughout - that Set route will amend road 3 rather than book a
+ * fourth - was gone the moment they touched anything. Carries the road's own
+ * colour down its edge, the same one it is drawn in on the map. */
+#routeEditing {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 4px 8px;
+  border-radius: 3px;
+  border-left: 3px solid var(--rd-accent);
+  background: var(--rd-panel-alt);
+  font-size: 12px;
+}
+
+/* display:flex would otherwise beat the hidden attribute. */
+#routeEditing[hidden] {
+  display: none;
+}
+
+#routeEditingLabel {
+  overflow-wrap: anywhere;
+}
+
 /* Secondary actions, kept out of the way of the one button that commits. */
 .routeLink {
   border: none;

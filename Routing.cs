@@ -63,6 +63,7 @@ namespace DvMod.RemoteDispatch
         public bool allocationApplied;
         public bool waitingForSignal;
         public int progressIndex;   // path entries before this are behind the train
+        public int frontIndex;      // the furthest path entry the train has reached
         public int releasedUpTo;    // junctions handed back, never re-taken
         public int rerouteCount;
         public float offRouteSince;
@@ -140,6 +141,7 @@ namespace DvMod.RemoteDispatch
             allocationApplied = false;
             waitingForSignal = false;
             progressIndex = 0;
+            frontIndex = 0;
             releasedUpTo = 0;
             rerouteCount = 0;
             offRouteSince = 0f;
@@ -545,6 +547,29 @@ namespace DvMod.RemoteDispatch
                 return route;
             }
 
+            // Planned before anything is given up. Planning reads the world -
+            // where the train is and what is in the way - not the route table,
+            // so it costs nothing to find out whether the new road exists first.
+            PlanLeg(route, trainset, allowReversal);
+
+            if (route.status == RouteStatus.Failed)
+            {
+                // A road that will not plan takes nothing away. Amending an
+                // itinerary and getting it wrong used to release the working
+                // road before discovering the new one was impossible, leaving
+                // the train with no road at all at the moment the dispatcher
+                // could least afford it. The failed attempt is still returned
+                // so the page can say why it failed, and is only put in the
+                // table when the train had no road to lose - which is the case
+                // Reroute arrives in, having already cleared the old one.
+                if (!routes.Values.Any(existing => existing.trainsetId == trainset.id))
+                {
+                    routes[route.id] = route;
+                    Sessions.AddTag("routes");
+                }
+                return route;
+            }
+
             // A train works one road at a time. Booking another used to leave
             // both in the table competing for the same junctions - one reported
             // as held short of its own train's other road - with the stale one
@@ -552,13 +577,9 @@ namespace DvMod.RemoteDispatch
             // gave up. Setting a road for a train that has one replaces it.
             ReplaceRoadsFor(trainset.id);
 
-            PlanLeg(route, trainset, allowReversal);
             routes[route.id] = route;
-            if (route.status != RouteStatus.Failed)
-            {
-                TryActivate(route);
-                Sessions.AddTag("routes");
-            }
+            TryActivate(route);
+            Sessions.AddTag("routes");
             return route;
         }
 
@@ -606,6 +627,10 @@ namespace DvMod.RemoteDispatch
                     + RouteDestination.Describe(destinationTrackId) + " in the loaded world.";
                 return false;
             }
+            // Which way the driver has asked to go. Held for the candidate
+            // loop below, which weighs it against distance.
+            var intent = IntendedHeading(trainset);
+
             var occupiedByOthers = new HashSet<RailTrack>();
             var poweredByOthers = new HashSet<RailTrack>();
             Occupancy.OccupiedTracksByOthers(
@@ -617,8 +642,10 @@ namespace DvMod.RemoteDispatch
                 // candidate aligned with the driver's reverser intent is safe.
                 // Considering the opposite end would itself be an unmodelled
                 // reverse move through those cars, even without PlanReversal.
-                var intent = Signalling.ReverserHeading(trainset);
-                if (intent.sqrMagnitude < 0.001f)
+                // The reverser itself, not IntendedHeading: past loose cars an
+                // explicit statement is wanted, and a train drifting is not one.
+                var stated = Signalling.ReverserHeading(trainset);
+                if (stated.sqrMagnitude < 0.001f)
                 {
                     route.status = RouteStatus.Failed;
                     route.message = "Detached cars share the train's track. Set the reverser toward the clear end before routing.";
@@ -638,7 +665,8 @@ namespace DvMod.RemoteDispatch
             // to intermediate stations and yards. The selected destination is
             // the only terminal condition. Distance remains the main cost, with
             // a small right-hand penalty so parallel and near-equivalent roads
-            // settle onto the left without sending trains on large detours.
+            // settle onto the left without sending trains on large detours, and
+            // a heavy one on leaving by the end the reverser is not pointed at.
             foreach (var candidate in candidates)
             {
                 var found = TrackGraph.FindPath(candidate, goals,
@@ -646,7 +674,8 @@ namespace DvMod.RemoteDispatch
                 if (found == null)
                     continue;
                 var length = PathLength(found);
-                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters;
+                var routeCost = length + CountRightHandChoices(found) * RightHandCostMeters
+                    + (AgreesWithIntent(candidate, intent) ? 0f : WrongEndPenaltyMeters);
                 if (path == null || routeCost < bestRouteCost
                     || (Mathf.Approximately(routeCost, bestRouteCost) && length < shortestLength))
                 {
@@ -671,7 +700,8 @@ namespace DvMod.RemoteDispatch
             // does - is not worth starting.
             var reversal = allowReversal && reversalStartClear
                     && bestRouteCost > ReversalPenaltyMeters
-                ? PlanReversal(candidates, goals, ConsistLength(trainset), IsBlocked, bestRouteCost)
+                ? PlanReversal(
+                    candidates, goals, ConsistLength(trainset), IsBlocked, bestRouteCost, intent)
                 : null;
             var useReversal = reversal != null && (path == null || reversal.Cost < bestRouteCost);
 
@@ -751,6 +781,72 @@ namespace DvMod.RemoteDispatch
         /// road is still the better move.
         private const float ReversalPenaltyMeters = 800f;
 
+        /// What it costs to send a train out of the end its reverser is not
+        /// pointed at, in the same currency.
+        ///
+        /// Deliberately the price of a reversal, because to the driver that is
+        /// exactly what it is: a road out of the other end is one they have to
+        /// change ends to run. Set at the same figure, a road going the way the
+        /// reverser is set wins every near-equal contest, and the reversal
+        /// search below - which produces a proper draw-forward-and-set-back
+        /// instruction rather than a silent about-turn - gets a fair look at
+        /// the cases where it does not.
+        ///
+        /// A penalty and not a veto. Where the only road to a place runs out of
+        /// the other end and no reversal can be planned, the train is still
+        /// given it rather than told there is no way there.
+        private const float WrongEndPenaltyMeters = ReversalPenaltyMeters;
+
+        /// Which way the driver means to go: the reverser where it is set, and
+        /// the train's own motion only where it is not.
+        ///
+        /// The reverser comes first because it is a statement of intent, while
+        /// motion is only evidence of one - a train easing back down a grade
+        /// with the reverser forward is not asking to be sent the other way.
+        /// Both the planner and the direction check read this one measure, so
+        /// the road that gets laid is not one the direction check will turn
+        /// round and re-lay a moment later.
+        private static Vector3 IntendedHeading(Trainset? trainset)
+        {
+            var reverser = Signalling.ReverserHeading(trainset);
+            if (reverser.sqrMagnitude > 0.001f)
+                return reverser.normalized;
+
+            var lead = trainset?.firstCar ?? trainset?.cars?.FirstOrDefault(c => c != null);
+            var velocity = lead?.rb != null ? lead.rb.velocity : Vector3.zero;
+            velocity.y = 0;
+            return velocity.sqrMagnitude >= 0.25f ? velocity.normalized : Vector3.zero;
+        }
+
+        /// The direction a train travels while running over this step: the chord
+        /// of the track from the end it comes on at to the end it leaves by.
+        ///
+        /// Taken from the two ends rather than a tangent, so there is no end-of-
+        /// curve convention to get the wrong way round: flipping the step is by
+        /// definition the same track entered from the other end.
+        private static Vector3 DepartureDirection(TrackGraph.Step step)
+        {
+            if (step.track == null)
+                return Vector3.zero;
+            var direction = TrackGraph.EndPosition(step)
+                - TrackGraph.EndPosition(TrackGraph.Flip(step));
+            direction.y = 0;
+            return direction;
+        }
+
+        /// Whether leaving on this step sends the train the way it has been
+        /// asked to go. With no intent expressed - reverser centred and standing
+        /// still - every road agrees, and distance decides as it always did.
+        private static bool AgreesWithIntent(TrackGraph.Step candidate, Vector3 intent)
+        {
+            if (intent.sqrMagnitude < 0.001f)
+                return true;
+            var departure = DepartureDirection(candidate);
+            if (departure.sqrMagnitude < 0.0001f)
+                return true;
+            return Vector3.Dot(departure.normalized, intent) > 0f;
+        }
+
         private sealed class ReversalPlan
         {
             public TrackGraph.Step start;
@@ -760,7 +856,14 @@ namespace DvMod.RemoteDispatch
             public float inboundMeters;
             public float runOutMeters;
 
-            public float Cost => outboundMeters + inboundMeters + ReversalPenaltyMeters;
+            /// Charged when the run out itself leaves by the end the reverser is
+            /// not pointed at. The outbound leg is the one the driver runs
+            /// first, so a reversal that starts by going the wrong way is no
+            /// better than a through road that does.
+            public float startPenalty;
+
+            public float Cost =>
+                outboundMeters + inboundMeters + ReversalPenaltyMeters + startPenalty;
         }
 
         /// Plan a road that runs out one way, changes ends, and draws back.
@@ -774,7 +877,7 @@ namespace DvMod.RemoteDispatch
         /// the direct road, or infinity when there is none.
         private static ReversalPlan? PlanReversal(
             List<TrackGraph.Step> candidates, HashSet<RailTrack> goals, float consistLength,
-            System.Func<TrackGraph.Step, bool> isBlocked, float ceiling)
+            System.Func<TrackGraph.Step, bool> isBlocked, float ceiling, Vector3 intent)
         {
             // One sweep out of the destination says which states can still reach
             // it, so the thousands of places a train might stand can be filtered
@@ -786,6 +889,8 @@ namespace DvMod.RemoteDispatch
             ReversalPlan? best = null;
             foreach (var candidate in candidates)
             {
+                var startPenalty =
+                    AgreesWithIntent(candidate, intent) ? 0f : WrongEndPenaltyMeters;
                 var exploration = TrackGraph.Explore(
                     candidate, MaxRunOutMeters, extraCost: LeftHandRunningPenalty,
                     isBlocked: isBlocked);
@@ -816,9 +921,12 @@ namespace DvMod.RemoteDispatch
                     if (outbound.Count == 0)
                         continue;
                     var outboundMeters = PathLength(outbound);
+                    // Still a floor with the penalty in it: the straight line
+                    // to the goal cannot exceed the rails that cover it, and the
+                    // penalty is charged in full on both sides of the comparison.
                     var floor = outboundMeters
                         + GoalDistance(TrackGraph.Flip(entry.Key), goals)
-                        + ReversalPenaltyMeters;
+                        + ReversalPenaltyMeters + startPenalty;
                     if (floor >= Mathf.Min(ceiling, best == null ? float.PositiveInfinity : best.Cost))
                         continue;
 
@@ -836,6 +944,7 @@ namespace DvMod.RemoteDispatch
                         outboundMeters = outboundMeters,
                         inboundMeters = PathLength(inbound),
                         runOutMeters = entry.Value,
+                        startPenalty = startPenalty,
                     };
                     if (best == null || plan.Cost < best.Cost)
                         best = plan;
@@ -935,6 +1044,7 @@ namespace DvMod.RemoteDispatch
             route.trackIds = route.reverseTrackIds;
             route.settings = SettingsForPath(route.reverseSteps);
             route.progressIndex = 0;
+            route.frontIndex = 0;
             route.releasedUpTo = 0;
             route.allocatedUpTo = int.MaxValue;
             route.pending.Clear();
@@ -1557,17 +1667,21 @@ namespace DvMod.RemoteDispatch
             if (occupied.Count == 0)
                 return;
 
-            // Scan the whole path, not just from the last known point: a train
-            // that backs up along its road should light the track behind it
-            // again rather than leaving it cleared.
+            // Both ends of the consist, over the whole path rather than from
+            // the last known point: a train that backs up along its road should
+            // light the track behind it again rather than leaving it cleared.
+            // The rearmost is how far the road may be handed back; the frontmost
+            // is where the train actually is on it, which is what the direction
+            // check has to read.
             var rearmost = -1;
+            var front = -1;
             for (var i = 0; i < route.pathTracks.Count; i++)
             {
-                if (occupied.Contains(route.pathTracks[i]))
-                {
+                if (!occupied.Contains(route.pathTracks[i]))
+                    continue;
+                if (rearmost < 0)
                     rearmost = i;
-                    break;
-                }
+                front = i;
             }
             if (rearmost < 0)
             {
@@ -1576,13 +1690,28 @@ namespace DvMod.RemoteDispatch
                 if (route.offRouteSince <= 0f)
                     route.offRouteSince = Time.time;
                 else if (Time.time - route.offRouteSince > OffRouteGraceSeconds)
-                    Reroute(route);
+                    Reroute(route, "the train left its road");
                 return;
             }
             route.offRouteSince = 0f;
 
             var moved = rearmost != route.progressIndex;
             route.progressIndex = rearmost;
+            route.frontIndex = front;
+
+            // Ground covered gives the recovery budget back. The count is there
+            // to stop a road being re-laid over and over from a spot it cannot
+            // be run from; it was never meant to ration how many times a train
+            // may be put back on its road over a whole journey. Never cleared,
+            // it did exactly that: five recomputations from any mix of causes -
+            // traffic diverted around, a shunt stepping off the road, a curve
+            // misread - could fall hours apart and still retire the road for
+            // good, blaming the train for leaving a road it was still on. Once
+            // the back of the train has moved up onto the second component of
+            // the road it was given, that road is working and the budget is
+            // whole again.
+            if (rearmost > 0)
+                route.rerouteCount = 0;
 
             // Junctions are handed back only as the train clears them for good.
             // Releasing and re-taking them as it shuffles back and forth would
@@ -1728,15 +1857,23 @@ namespace DvMod.RemoteDispatch
             }
         }
 
-        /// Recompute a road for a train that has left the one it was given.
-        private static void Reroute(TrainRoute route)
+        /// Recompute a road for a train that has left the one it was given, or
+        /// is running against it. The cause is what prompted this attempt, so a
+        /// road that gives up can say what it gave up on rather than blaming the
+        /// train for leaving a road it may never have left.
+        private static void Reroute(TrainRoute route, string cause)
         {
             if (route.rerouteCount >= MaxReroutes)
             {
                 route.status = RouteStatus.Failed;
-                route.message = "Train left its road and could not be rerouted.";
+                route.message = "Gave up after " + MaxReroutes + " attempts to re-lay this"
+                    + " road without the train getting anywhere on it (last attempt: "
+                    + cause + "). Set the road again from where the train stands.";
                 return;
             }
+            Main.DebugLog(() =>
+                $"Route {route.id}: re-laying, attempt {route.rerouteCount + 1}"
+                + $" of {MaxReroutes} ({cause}).");
 
             var trainset = FindTrainset(route.trainsetId);
             if (trainset == null || !RouteDestination.Exists(route.destinationTrackId))
@@ -1840,7 +1977,13 @@ namespace DvMod.RemoteDispatch
                 trainset, route.stops, allowReversal: false, startStop: route.stopIndex);
             if (replacement.status != RouteStatus.Failed)
             {
-                replacement.rerouteCount = route.rerouteCount + 1;
+                // Deliberately not charged to rerouteCount. That budget is for
+                // recovering a train that has come off its road; a diversion
+                // round traffic is a road working as intended, and it already
+                // has its own ten-second gate and its own restore-on-failure
+                // above. Charging it there only leaked: a train held at a red
+                // behind an obstruction spent the whole recovery budget standing
+                // still, then died on the first real re-lay once it got moving.
                 replacement.requestedBy = route.requestedBy;
                 replacement.notice = "Rerouted around occupied " + obstructionId + ". ";
                 UpdateStatus(replacement);
@@ -1907,35 +2050,45 @@ namespace DvMod.RemoteDispatch
             if (trainset == null)
                 return;
 
-            // Motion is the best evidence of where a train is going; before it
-            // moves, the reverser states the same intent.
-            var lead = trainset.firstCar ?? trainset.cars?.FirstOrDefault(c => c != null);
-            var velocity = lead?.rb != null ? lead.rb.velocity : Vector3.zero;
-            velocity.y = 0;
+            // The same measure the road was planned against, so the two cannot
+            // disagree: the reverser where it is set, motion where it is not. A
+            // check reading motion while the planner read the reverser is a
+            // check that re-lays every road a train rolls back a yard on.
+            var heading = IntendedHeading(trainset);
+            if (heading.sqrMagnitude < 0.001f)
+                return;   // standing with the reverser centred: nothing to check
 
-            Vector3 heading;
-            if (velocity.sqrMagnitude >= 0.25f)
-                heading = velocity.normalized;
-            else
-            {
-                heading = Signalling.ReverserHeading(trainset);
-                if (heading.sqrMagnitude < 0.001f)
-                    return;   // standing with the reverser centred: nothing to check
-            }
-
-            // Where the booked road goes from where the train currently is.
-            var index = Mathf.Clamp(route.progressIndex, 0, route.pathTracks.Count - 2);
-            var here = route.pathTracks[index];
-            var next = route.pathTracks[index + 1];
-            if (here == null || next == null)
+            // Where the booked road goes from the leading end of the train, not
+            // from the back of it. Progress is measured at the rearmost vehicle,
+            // and on a long consist - or anywhere the line curves hard, which on
+            // this map is most of it - the stretch of road under the back of the
+            // train sits at any angle to the stretch under the front. Reading
+            // the whole train's motion against the rear's stretch called an
+            // ordinary run wrong-way and re-laid the road out from under it.
+            if (route.pathSteps.Count < 2)
+                return;
+            var index = Mathf.Clamp(
+                Mathf.Max(route.frontIndex, route.progressIndex),
+                0, route.pathSteps.Count - 2);
+            if (route.pathTracks[index] == null || route.pathSteps[index].track == null)
                 return;
 
-            var alongRoute = CentreOf(next) - CentreOf(here);
+            // The chord of that component in the direction the road is travelled:
+            // from where the train came onto it to where it leaves. A line
+            // between two track centres was the wrong measure - on a curve it
+            // can sit at any angle to the rails the train is actually on.
+            var alongRoute = TrackGraph.EndPosition(route.pathSteps[index])
+                - (index > 0
+                    ? TrackGraph.EndPosition(route.pathSteps[index - 1])
+                    : CentreOf(route.pathTracks[index]));
             alongRoute.y = 0;
             if (alongRoute.sqrMagnitude < 0.01f)
                 return;
 
-            if (Vector3.Dot(alongRoute.normalized, heading) >= 0f)
+            // Clearly opposed, not merely off square. Square to the road is what
+            // a train rounding a curve reads as, and a threshold of exactly
+            // ninety degrees made that enough to re-lay it.
+            if (Vector3.Dot(alongRoute.normalized, heading) > -OpposedDot)
             {
                 route.wrongWaySince = 0f;
                 return;
@@ -1955,13 +2108,17 @@ namespace DvMod.RemoteDispatch
                 return;
 
             route.wrongWaySince = 0f;
-            Main.DebugLog(() => $"Route {route.id}: travelling opposite the booked road; re-laying.");
-            Reroute(route);
+            Reroute(route, "the train was travelling against its road");
         }
 
         /// How long a train must be heading against its road before it is
         /// re-laid, so a shunt or a rollback does not trigger one.
         public const float WrongWayGraceSeconds = 2f;
+
+        /// How far past square a train has to be pointed before it counts as
+        /// running against its road: about a hundred and five degrees. Anything
+        /// tighter reads a curve as a reversal.
+        public const float OpposedDot = 0.25f;
 
         private static Vector3 CentreOf(RailTrack track)
         {
