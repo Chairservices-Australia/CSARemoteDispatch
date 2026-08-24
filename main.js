@@ -575,6 +575,70 @@ function createTrackLabels(trackId, coords) {
   }
 }
 
+/////////////////////
+// map picture
+
+// A picture drawn under the railway - a community map or a render. Derail
+// Valley is not a real place, so there is no aerial photography to fetch, and
+// the terrain the game does have cannot be read from the mod: its distant
+// meshes are not readable and its detailed terrain exists only where the player
+// has been. The picture is lined up by its corners, given in the same world
+// metres the tracks are drawn in, so it stays put however far anyone travels.
+let mapImageOverlay = null;
+
+// Its own pane, below the one Leaflet draws overlays into, so the picture can
+// never end up over the railway whatever order things load in.
+map.createPane('mapPicture');
+map.getPane('mapPicture').style.zIndex = 350;
+map.getPane('mapPicture').style.pointerEvents = 'none';
+
+function refreshMapPicture() {
+  return fetchJson(new URL('/mapOverlay', location))
+    .then(info => {
+      if (mapImageOverlay) {
+        map.removeLayer(mapImageOverlay);
+        mapImageOverlay = null;
+      }
+      reportMapPicture(info);
+      if (!info || !info.enabled || !Array.isArray(info.bounds))
+        return;
+      // Cache-busted, so replacing the file on disk shows up on a reload
+      // rather than being served from the browser's copy for ever.
+      const url = new URL('/mapOverlay/image', location);
+      url.searchParams.set('t', String(Date.now()));
+      mapImageOverlay = L.imageOverlay(url.href, info.bounds, {
+        opacity: typeof info.opacity === 'number' ? info.opacity : 0.75,
+        pane: 'mapPicture',
+        interactive: false,
+      }).addTo(map);
+    })
+    .catch(() => {});
+}
+
+// Where the rails actually are, so the corners can be lined up against
+// something rather than guessed at.
+function reportMapPicture(info) {
+  const status = document.getElementById('mapPictureStatus');
+  if (!status)
+    return;
+  const rails = info && info.railBounds;
+  const extent = rails
+    ? `Rails span X ${Math.round(rails.minX)} to ${Math.round(rails.maxX)},`
+      + ` Z ${Math.round(rails.minZ)} to ${Math.round(rails.maxZ)}.`
+    : '';
+  if (!info || !info.configured)
+    status.textContent = 'No picture set. Choose one in the mod settings. ' + extent;
+  else if (info.error)
+    status.textContent = info.error + ' ' + extent;
+  else if (!info.enabled)
+    status.textContent = 'Picture turned off in the mod settings. ' + extent;
+  else
+    status.textContent = 'Picture shown. ' + extent;
+}
+
+/////////////////////
+// tracks
+
 const tracksReady = fetchJson(new URL('/track', location))
 .then(tracks => {
   Object.entries(tracks).forEach(([trackId, coords]) => {
@@ -1922,6 +1986,10 @@ function updateLoop() {
   });
 }
 
+document.getElementById('mapPictureReload')
+  ?.addEventListener('click', refreshMapPicture);
+
 junctionsReady.then(_ => {
+  refreshMapPicture();
   updateLoop();
 });

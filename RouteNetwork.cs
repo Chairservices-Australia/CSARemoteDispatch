@@ -86,9 +86,12 @@ namespace DvMod.RemoteDispatch
         {
             if (!Present)
                 return "";
-            if (cachedLocalName == null)
+            // Only a name worth having is kept. The mod can be loaded long
+            // before a session exists, and caching the empty answer from that
+            // moment meant the name never appeared once one did.
+            if (string.IsNullOrEmpty(cachedLocalName))
                 cachedLocalName = LocalPlayerNameCore();
-            return cachedLocalName;
+            return cachedLocalName ?? "";
         }
 
         private static string? cachedLocalName;
@@ -98,6 +101,24 @@ namespace DvMod.RemoteDispatch
         {
             try
             {
+                // The name is on none of the API objects themselves - the client
+                // knows only which player it is - so the player has to be
+                // fetched by that id before it can be named.
+                var client = MultiplayerAPI.Client;
+                var id = client == null
+                    ? null : client.GetType().GetProperty("PlayerId")?.GetValue(client, null);
+                if (id != null)
+                {
+                    foreach (var host in new object?[] { MultiplayerAPI.Instance, MultiplayerAPI.Server })
+                    {
+                        var name = NameOn(FetchPlayer(host, id));
+                        if (name.Length > 0)
+                            return name;
+                    }
+                }
+
+                // Should a later release hang the name directly off one of them
+                // after all, take it from there.
                 foreach (var source in new object?[] { MultiplayerAPI.Client, MultiplayerAPI.Instance })
                 {
                     var name = NameOn(source);
@@ -110,6 +131,34 @@ namespace DvMod.RemoteDispatch
                 Main.DebugLog(() => "Could not read the multiplayer player name: " + e.Message);
             }
             return "";
+        }
+
+        /// Ask an API object for the player with this id, whatever numeric type
+        /// its own accessor happens to take.
+        private static object? FetchPlayer(object? host, object id)
+        {
+            if (host == null)
+                return null;
+            foreach (var method in host.GetType().GetMethods())
+            {
+                if (method.Name != "GetPlayer")
+                    continue;
+                var parameters = method.GetParameters();
+                if (parameters.Length != 1)
+                    continue;
+                try
+                {
+                    var converted = Convert.ChangeType(id, parameters[0].ParameterType);
+                    var player = method.Invoke(host, new[] { converted });
+                    if (player != null)
+                        return player;
+                }
+                catch
+                {
+                    // Wrong overload, or it did not like the id. Try the next.
+                }
+            }
+            return null;
         }
 
         private static string NameOn(object? source)

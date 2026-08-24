@@ -18,14 +18,47 @@ namespace DvMod.RemoteDispatch
         public bool showUndiscoveredLocomotives = false;
         public bool enableLogging = false;
 
+        /// A picture drawn under the railway on the map, and the world metres
+        /// its corners sit at. See MapOverlay for why this is a picture you
+        /// supply rather than one the mod can draw for you.
+        public bool showMapImage = true;
+        public string mapImagePath = "";
+        public float mapImageOpacity = 0.75f;
+        public float mapImageMinX;
+        public float mapImageMinZ;
+        public float mapImageMaxX = 16384f;
+        public float mapImageMaxZ = 16384f;
+
         public readonly string? version = Main.mod?.Info.Version;
 
         const char EnDash = '\u2013';
         private string uncommittedPort = "initial";
+        private string uncommittedMinX = "initial";
+        private string uncommittedMaxX = "initial";
+        private string uncommittedMinZ = "initial";
+        private string uncommittedMaxZ = "initial";
         private string message = "";
         private bool capturingSignalHudHotkey;
 
         public bool IsCapturingSignalHudHotkey => capturingSignalHudHotkey;
+
+        /// A number the user can type freely into - emptying it, or leaving a
+        /// lone minus sign part way through - without the value jumping about
+        /// underneath them. Only a reading that parses is taken.
+        private static float NumberField(string label, float value, ref string uncommitted)
+        {
+            if (uncommitted == "initial")
+                uncommitted = value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(false));
+            GUILayout.Label(label, GUILayout.Width(130f));
+            uncommitted = GUILayout.TextField(uncommitted, maxLength: 12, GUILayout.Width(100f));
+            GUILayout.EndHorizontal();
+
+            return float.TryParse(uncommitted, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+                ? parsed : value;
+        }
 
         public void Draw()
         {
@@ -94,6 +127,38 @@ namespace DvMod.RemoteDispatch
                 Event.current.Use();
             }
 
+            GUILayout.Space(6f);
+            GUILayout.Label("Map picture:");
+            GUILayout.Label("An image drawn under the railway - a community map or a render."
+                + " Derail Valley is not a real place, so there is no aerial photography of it"
+                + " to fetch, and the terrain the game does have cannot be read from here.");
+            showMapImage = GUILayout.Toggle(showMapImage, "Show the picture behind the map");
+
+            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(false));
+            GUILayout.Label("Image file", GUILayout.Width(130f));
+            mapImagePath = GUILayout.TextField(mapImagePath ?? "", GUILayout.Width(360f));
+            GUILayout.EndHorizontal();
+            GUILayout.Label("Full path to a .png, .jpg or .webp file.");
+
+            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(false));
+            GUILayout.Label("Opacity", GUILayout.Width(130f));
+            mapImageOpacity = GUILayout.HorizontalSlider(
+                mapImageOpacity, 0f, 1f, GUILayout.Width(200f));
+            GUILayout.Label(Mathf.RoundToInt(mapImageOpacity * 100f) + "%", GUILayout.Width(50f));
+            GUILayout.EndHorizontal();
+
+            // The corners are in the same absolute world metres the track
+            // geometry is drawn in, so a picture lined up once stays lined up
+            // however far the player travels.
+            GUILayout.Label("Corners, in world metres:");
+            mapImageMinX = NumberField("West (min X)", mapImageMinX, ref uncommittedMinX);
+            mapImageMaxX = NumberField("East (max X)", mapImageMaxX, ref uncommittedMaxX);
+            mapImageMinZ = NumberField("South (min Z)", mapImageMinZ, ref uncommittedMinZ);
+            mapImageMaxZ = NumberField("North (max Z)", mapImageMaxZ, ref uncommittedMaxZ);
+            GUILayout.Label("The map page reports where the rails actually are, so the corners"
+                + " can be lined up against something rather than guessed at.");
+
+            GUILayout.Space(6f);
             enableLogging = GUILayout.Toggle(enableLogging, "Enable logging");
 
             GUILayout.EndVertical();

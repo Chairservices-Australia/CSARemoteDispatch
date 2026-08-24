@@ -817,3 +817,12 @@ body.theme-dark .followControl a.followControlButton.active svg {
 body.theme-dark .routeCard .routeMessage-action {
   color: #d5a6ff;
 }
+
+/* Where the rails are, so a picture's corners can be lined up against
+   something rather than guessed at. */
+#mapPictureStatus {
+  font-size: 11px;
+  color: var(--rd-text-muted);
+  margin-top: 3px;
+  max-width: 260px;
+}

@@ -146,6 +146,9 @@ namespace DvMod.RemoteDispatch
             case "route":
                 await HandleRouteRequest(context).ConfigureAwait(false);
                 break;
+            case "mapOverlay":
+                await HandleMapOverlayRequest(context).ConfigureAwait(false);
+                break;
             case "station":
                 Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
                     Stations.GetStationJSON).ConfigureAwait(false));
@@ -324,6 +327,40 @@ namespace DvMod.RemoteDispatch
             }
 
             RenderError(context, 404, "Unknown route request.");
+        }
+
+        /// GET /mapOverlay        where the picture sits and how to draw it
+        /// GET /mapOverlay/image  the picture itself
+        private static async Task HandleMapOverlayRequest(HttpListenerContext context)
+        {
+            var segments = context.Request.Url.Segments;
+            if (segments.Length == 2)
+            {
+                Render200(context, ContentTypes.Json, await Updater.RunOnMainThread(
+                    MapOverlay.InfoJson).ConfigureAwait(false));
+                return;
+            }
+
+            if (segments.Length == 3 && segments[2].TrimEnd('/') == "image")
+            {
+                var read = await Updater.RunOnMainThread(() =>
+                {
+                    var ok = MapOverlay.TryRead(out var bytes, out var type);
+                    return (ok, bytes, type);
+                }).ConfigureAwait(false);
+                if (!read.ok)
+                {
+                    RenderEmpty(context, 404);
+                    return;
+                }
+                context.Response.ContentType = read.type;
+                context.Response.ContentLength64 = read.bytes.Length;
+                context.Response.OutputStream.Write(read.bytes, 0, read.bytes.Length);
+                context.Response.Close();
+                return;
+            }
+
+            RenderEmpty(context, 404);
         }
 
         private static async Task HandleJunctionRequest(HttpListenerContext context)
