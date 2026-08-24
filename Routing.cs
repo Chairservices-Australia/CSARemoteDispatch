@@ -1751,6 +1751,7 @@ namespace DvMod.RemoteDispatch
         /// made. Generous: a train this close is at the turnout for any purpose
         /// a dispatcher has in mind.
         public const float JunctionArrivalMeters = 50f;
+        public const float RegionalStationArrivalMeters = 75f;
 
         /// Whether the train has actually got to the place the road was booked
         /// to.
@@ -1763,6 +1764,28 @@ namespace DvMod.RemoteDispatch
         /// turnout that was asked for.
         private static bool HasReachedDestination(TrainRoute route)
         {
+            if (RouteDestination.IsRegional(route.destinationTrackId))
+            {
+                var stationId = route.destinationTrackId
+                    .Substring(RouteDestination.RegionalPrefix.Length);
+                if (!Stations.TryRegionalStation(stationId, out _, out var center))
+                    return false;
+                var regionalCars = FindTrainset(route.trainsetId)?.cars;
+                if (regionalCars == null)
+                    return false;
+                foreach (var car in regionalCars)
+                {
+                    if (car == null)
+                        continue;
+                    var absolute = car.transform.position - WorldMover.currentMove;
+                    var dx = absolute.x - center.x;
+                    var dz = absolute.z - center.z;
+                    if (dx * dx + dz * dz <= RegionalStationArrivalMeters
+                        * RegionalStationArrivalMeters)
+                        return true;
+                }
+                return false;
+            }
             var junction = RouteDestination.FindJunction(route.destinationTrackId);
             if (junction == null)
                 return true;

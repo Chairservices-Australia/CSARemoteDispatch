@@ -1,7 +1,10 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using UnityEngine;
 
 namespace DvMod.RemoteDispatch
@@ -12,6 +15,7 @@ namespace DvMod.RemoteDispatch
     {
         private static string? stationJSON;
         private static int cachedTrackVersion = -1;
+        private static int cachedRegionalStationCount = -1;
 
         /// Building this walks every station's tracks and resamples the geometry
         /// of each one to find the yard centre, which is far too much to repeat
@@ -23,10 +27,13 @@ namespace DvMod.RemoteDispatch
             if (!WorldStreamingInit.Instance || !WorldStreamingInit.IsLoaded)
                 throw new System.Exception("World not yet loaded");
             TrackCatalog.RefreshIfStale();
-            if (stationJSON == null || cachedTrackVersion != TrackCatalog.Version)
+            var regionalStations = PassengerRegionalStations();
+            if (stationJSON == null || cachedTrackVersion != TrackCatalog.Version
+                || cachedRegionalStationCount != regionalStations.Count)
             {
-                stationJSON = JsonConvert.SerializeObject(GetStationData());
+                stationJSON = JsonConvert.SerializeObject(GetStationData(regionalStations));
                 cachedTrackVersion = TrackCatalog.Version;
+                cachedRegionalStationCount = regionalStations.Count;
             }
             return stationJSON;
         }
@@ -35,9 +42,10 @@ namespace DvMod.RemoteDispatch
         {
             stationJSON = null;
             cachedTrackVersion = -1;
+            cachedRegionalStationCount = -1;
         }
 
-        private static JArray GetStationData()
+        private static JArray GetStationData(List<RegionalStation> regionalStations)
         {
             var stationControllers = (StationController.allStations ?? new List<StationController>())
                 .Where(station => station != null && station.StationInfoValid)
@@ -88,7 +96,128 @@ namespace DvMod.RemoteDispatch
                     new JProperty("position", center.Value.ToLatLon().ToJson()),
                     new JProperty("tracks", new JArray(TrackIdsOf(group.Value)))));
             }
+
+            // Passenger Jobs regional stations are platform-length sections of
+            // otherwise unnamed main-line track. They deliberately have no
+            // StationController and their station ID (for example "AM") is not
+            // a real TrackID, so neither discovery path above can see them. The
+            // passenger mod does expose the live platform controller and its
+            // underlying warehouse track; turn those into ordinary routable
+            // station entries without taking a compile-time dependency on the
+            // optional mod.
+            foreach (var station in regionalStations.Where(item => !represented.Contains(item.id)))
+            {
+                represented.Add(station.id);
+                result.Add(new JObject(
+                    new JProperty("yardId", station.id),
+                    new JProperty("name", "Regional station"),
+                    new JProperty("type", "Passenger"),
+                    new JProperty("color", "#DCCCFF"),
+                    new JProperty("position", station.center.ToLatLon().ToJson()),
+                    new JProperty("tracks", new JArray(new JObject(
+                        new JProperty("id", RouteDestination.RegionalPrefix + station.id),
+                        new JProperty("display", station.id + "-LP"))))));
+            }
             return result;
+        }
+
+        private sealed class RegionalStation
+        {
+            public string id = "";
+            public World.Position center;
+            public List<RailTrack> tracks = new List<RailTrack>();
+        }
+
+        public static bool TryRegionalStation(
+            string stationId, out List<RailTrack> tracks, out World.Position center)
+        {
+            var station = PassengerRegionalStations()
+                .FirstOrDefault(item => item.id == stationId);
+            if (station != null)
+            {
+                tracks = station.tracks;
+                center = station.center;
+                return tracks.Count > 0;
+            }
+            tracks = new List<RailTrack>();
+            center = default;
+            return false;
+        }
+
+        /// Discover Passenger Jobs' live rural platforms through its public
+        /// controller API. Reflection keeps Remote Dispatch loadable when that
+        /// mod is absent or changes; failure simply leaves the vanilla station
+        /// list untouched.
+        private static List<RegionalStation> PassengerRegionalStations()
+        {
+            var result = new List<RegionalStation>();
+            try
+            {
+                var type = AppDomain.CurrentDomain.GetAssemblies()
+                    .Select(assembly => assembly.GetType(
+                        "PassengerJobs.Platforms.PlatformController", false))
+                    .FirstOrDefault(found => found != null);
+                var controllers = type?.GetProperty("AllPlatformControllers",
+                    BindingFlags.Public | BindingFlags.Static)?.GetValue(null, null) as IEnumerable;
+                if (controllers == null)
+                    return result;
+
+                foreach (var controller in controllers)
+                {
+                    var platform = MemberValue(controller, "Platform");
+                    if (platform == null || platform.GetType().FullName
+                        != "PassengerJobs.Platforms.RuralPlatformWrapper")
+                        continue;
+                    var id = MemberValue(platform, "Id") as string;
+                    var warehouse = MemberValue(platform, "Warehouse");
+                    var logicTrack = MemberValue(warehouse, "WarehouseTrack");
+                    var trackIdObject = MemberValue(logicTrack, "ID");
+                    var fullId = MemberValue(trackIdObject, "FullID") as string
+                        ?? trackIdObject?.ToString();
+                    if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(fullId))
+                        continue;
+
+                    var tracks = TrackCatalog.WithId(fullId!);
+                    // The underlying rail can be a very long unnamed main-line
+                    // component, so its geometric centre may be kilometres from
+                    // the platform. Passenger Jobs puts the controller on the
+                    // generated platform itself; convert that shifted Unity
+                    // position back to the absolute coordinates used by the map.
+                    World.Position? center = null;
+                    if (controller is Component component)
+                    {
+                        var absolute = component.transform.position - WorldMover.currentMove;
+                        center = new World.Position(absolute.x, absolute.z);
+                    }
+                    if (center == null)
+                        center = CenterOf(tracks);
+                    if (center == null)
+                        continue;
+                    result.Add(new RegionalStation
+                    {
+                        id = id!,
+                        center = center.Value,
+                        tracks = tracks.ToList(),
+                    });
+                }
+            }
+            catch (Exception exception)
+            {
+                Main.DebugLog(() => "Passenger regional station discovery failed: "
+                    + exception.Message);
+            }
+            return result;
+        }
+
+        private static object? MemberValue(object? instance, string name)
+        {
+            if (instance == null)
+                return null;
+            var type = instance.GetType();
+            return type.GetProperty(name, BindingFlags.Public | BindingFlags.Instance)
+                    ?.GetValue(instance, null)
+                ?? type.GetField(name, BindingFlags.Public | BindingFlags.Instance)
+                    ?.GetValue(instance);
         }
 
         private static JObject? StationToJson(StationController station, IEnumerable<RailTrack> discovered)

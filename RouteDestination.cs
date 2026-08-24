@@ -15,6 +15,13 @@ namespace DvMod.RemoteDispatch
     public static class RouteDestination
     {
         public const string JunctionPrefix = "J-";
+        public const string RegionalPrefix = "REG-";
+
+        public static bool IsRegional(string id) =>
+            !string.IsNullOrEmpty(id) && id.StartsWith(RegionalPrefix);
+
+        private static string RegionalStationId(string id) =>
+            id.Substring(RegionalPrefix.Length);
 
         /// How many places one road may call at, and what separates them in the
         /// single string that carries a whole itinerary over HTTP and over the
@@ -56,6 +63,13 @@ namespace DvMod.RemoteDispatch
         public static HashSet<RailTrack> Goals(string id)
         {
             var goals = new HashSet<RailTrack>();
+            if (IsRegional(id))
+            {
+                if (Stations.TryRegionalStation(RegionalStationId(id), out var tracks, out _))
+                    foreach (var track in tracks)
+                        goals.Add(track);
+                return goals;
+            }
             var junction = FindJunction(id);
             if (junction != null)
             {
@@ -93,6 +107,13 @@ namespace DvMod.RemoteDispatch
                         return id;
                     continue;
                 }
+                if (IsRegional(id))
+                {
+                    if (!Stations.TryRegionalStation(
+                        RegionalStationId(id), out _, out _))
+                        return id;
+                    continue;
+                }
                 wanted.Add(id);
             }
             if (wanted.Count == 0)
@@ -104,6 +125,7 @@ namespace DvMod.RemoteDispatch
         public static string Describe(string id) =>
             string.IsNullOrEmpty(id) ? "nowhere"
             : IsJunction(id) ? "junction " + id
+            : IsRegional(id) ? "regional station " + RegionalStationId(id)
             : id;
 
         /// Split an itinerary carried as one string, dropping blanks and
