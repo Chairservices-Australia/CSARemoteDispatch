@@ -14,7 +14,9 @@ namespace DvMod.RemoteDispatch
 {
     public static class JobData
     {
-        private static readonly Dictionary<TrainCar, string> jobIdForCar = InitializeJobIdForCar();
+        private static readonly Dictionary<TrainCar, string> jobIdForCar =
+            new Dictionary<TrainCar, string>();
+        private static bool jobIdForCarSeeded;
         private static Dictionary<string, Job> jobForId = new Dictionary<string, Job>();
 
         private const JobLicenses LicensesToExport =
@@ -24,6 +26,7 @@ namespace DvMod.RemoteDispatch
 
         public static string? JobIdForCar(TrainCar car)
         {
+            EnsureJobIdForCarSeeded();
             jobIdForCar.TryGetValue(car, out var jobId);
             return jobId;
         }
@@ -117,11 +120,41 @@ namespace DvMod.RemoteDispatch
             return matched;
         }
 
-        private static Dictionary<TrainCar, string> InitializeJobIdForCar()
+        /// Fill the per-car index from the jobs already set up, once there is a
+        /// world to read them from.
+        ///
+        /// This was a static field initialiser reading JobsManager directly, and
+        /// a static initialiser that can throw is a trap: the first touch of the
+        /// class decides, and if it fails the type stays broken for the rest of
+        /// the process. Touching JobData with no world loaded - on the way out
+        /// to the main menu, say - left every later call throwing
+        /// TypeInitializationException, including inside the game's own job
+        /// code, which concluded its state was corrupt and deleted the cars and
+        /// jobs. Nothing here may throw, and none of it may run before there is
+        /// something to read.
+        private static void EnsureJobIdForCarSeeded()
         {
-            return SingletonBehaviour<JobsManager>.Instance.jobToJobCars
-                .SelectMany(kvp => kvp.Value.Select(car => (trainCar: car.TrainCar(), job: kvp.Key)))
-                .ToDictionary(p => p.trainCar, p => p.job.ID);
+            if (jobIdForCarSeeded)
+                return;
+            var manager = SingletonBehaviour<JobsManager>.Instance;
+            var jobs = manager == null ? null : manager.jobToJobCars;
+            if (jobs == null)
+                return;   // No world yet. Try again the next time it is asked.
+
+            jobIdForCarSeeded = true;
+            foreach (var pair in jobs)
+            {
+                if (pair.Key == null || pair.Value == null)
+                    continue;
+                foreach (var car in pair.Value)
+                {
+                    // Indexer rather than ToDictionary: a car named by two jobs
+                    // is not a reason to break the class for good either.
+                    var trainCar = car?.TrainCar();
+                    if (trainCar != null)
+                        jobIdForCar[trainCar] = pair.Key.ID;
+                }
+            }
         }
 
         /// The least time between index rebuilds forced by a lookup that found
@@ -159,17 +192,26 @@ namespace DvMod.RemoteDispatch
         {
             jobForId = new Dictionary<string, Job>();
             lastJobIndexBuild = float.NegativeInfinity;
+            // Safe to drop now that it is seeded on demand rather than once,
+            // for good, by a static initialiser.
+            jobIdForCar.Clear();
+            jobIdForCarSeeded = false;
         }
 
         private static void RebuildJobIndex()
         {
             lastJobIndexBuild = Time.time;
             var rebuilt = new Dictionary<string, Job>();
-            foreach (var job in SingletonBehaviour<JobsManager>.Instance.jobToJobCars.Keys)
+            var manager = SingletonBehaviour<JobsManager>.Instance;
+            var jobs = manager == null ? null : manager.jobToJobCars;
+            if (jobs != null)
             {
-                if (job != null && job.ID != null)
-                    rebuilt[job.ID] = job;   // indexer, not ToDictionary: a
-                                             // duplicate ID must not throw here
+                foreach (var job in jobs.Keys)
+                {
+                    if (job != null && job.ID != null)
+                        rebuilt[job.ID] = job;   // indexer, not ToDictionary: a
+                                                 // duplicate ID must not throw
+                }
             }
             jobForId = rebuilt;
         }
@@ -301,6 +343,9 @@ namespace DvMod.RemoteDispatch
             {
                 public static void Postfix(JobChainController __instance, string jobId)
                 {
+                    // Seed first, so what the game tells us here is not later
+                    // overwritten by a sweep of jobs as they stood before it.
+                    EnsureJobIdForCarSeeded();
                     foreach (Car car in __instance.carsForJobChain)
                     {
                         var trainCar = car.TrainCar();
