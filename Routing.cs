@@ -1694,7 +1694,8 @@ namespace DvMod.RemoteDispatch
             }
             route.offRouteSince = 0f;
 
-            var moved = rearmost != route.progressIndex;
+            var rearMoved = rearmost != route.progressIndex;
+            var frontMoved = front != route.frontIndex;
             route.progressIndex = rearmost;
             route.frontIndex = front;
 
@@ -1737,7 +1738,12 @@ namespace DvMod.RemoteDispatch
                 ClearRoute(route.id);
                 return;
             }
-            if (moved)
+            // The rear controls reservations, but the front controls what is
+            // visibly still ahead of the train. Publish either movement: on a
+            // long consist the front can pass several route components while
+            // the rear remains on the same one, which previously left already
+            // travelled road painted until the rear finally crossed a switch.
+            if (rearMoved || frontMoved)
                 Sessions.AddTag("routes");
         }
 
@@ -2151,6 +2157,13 @@ namespace DvMod.RemoteDispatch
                             continue;
                         Sessions.AddTag("routes");
                     }
+                    // Refresh progress on every periodic pass, including the
+                    // outbound half of a reversing move. Visual progress uses
+                    // the leading end; safe release of switches continues to
+                    // use the rearmost vehicle inside UpdateProgress.
+                    UpdateProgress(route);
+                    if (!routes.ContainsKey(route.id))
+                        continue;   // arrived or rerouted during the update
                     // A train working towards a reversal is travelling the way
                     // it was told to; the direction check would read the coming
                     // change of ends as running the wrong way and re-lay the
@@ -2174,9 +2187,6 @@ namespace DvMod.RemoteDispatch
                     // released since the last tick.
                     if (route.allocationApplied && route.allocatedUpTo != int.MaxValue)
                         ExtendAllocation(route);
-                    UpdateProgress(route);
-                    if (!routes.ContainsKey(route.id))
-                        continue;   // arrived or rerouted during the update
                     Revalidate(route);
                     if (route.pending.Count == 0)
                     {
@@ -2360,7 +2370,10 @@ namespace DvMod.RemoteDispatch
             new JProperty("rightDivergences", route.rightDivergences),
             new JProperty("distanceMeters", System.Math.Round(route.distanceMeters, 1)),
             new JProperty("divergenceDetail", route.divergenceDetail),
-            new JProperty("tracks", new JArray(route.trackIds.Skip(route.progressIndex))),
+            // Drawing follows the leading end so only road still ahead remains
+            // highlighted. progressIndex deliberately remains the rear for
+            // reservations and junction release safety.
+            new JProperty("tracks", new JArray(route.trackIds.Skip(route.frontIndex))),
             new JProperty("passedTracks", route.progressIndex));
 
         public static string AllRoutesJson() =>
