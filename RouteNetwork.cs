@@ -1,3 +1,4 @@
+using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -70,6 +71,62 @@ namespace DvMod.RemoteDispatch
         {
             var api = MultiplayerAPI.Instance;
             return api == null || !api.IsConnected || api.IsHost;
+        }
+
+        /// The name the Multiplayer mod knows this player by, or empty when it
+        /// is not loaded or has no name to give.
+        ///
+        /// Read by reflection rather than against a named property. The API
+        /// carries Username and DisplayName but exposes no "this is me"
+        /// accessor, and where the local name hangs has moved between releases;
+        /// a dispatcher's name on a card is not worth a hard binding that stops
+        /// the mod loading when it moves again. Anything not found simply falls
+        /// back, so the worst case is the label this replaced.
+        public static string LocalPlayerName()
+        {
+            if (!Present)
+                return "";
+            if (cachedLocalName == null)
+                cachedLocalName = LocalPlayerNameCore();
+            return cachedLocalName;
+        }
+
+        private static string? cachedLocalName;
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static string LocalPlayerNameCore()
+        {
+            try
+            {
+                foreach (var source in new object?[] { MultiplayerAPI.Client, MultiplayerAPI.Instance })
+                {
+                    var name = NameOn(source);
+                    if (name.Length > 0)
+                        return name;
+                }
+            }
+            catch (Exception e)
+            {
+                Main.DebugLog(() => "Could not read the multiplayer player name: " + e.Message);
+            }
+            return "";
+        }
+
+        private static string NameOn(object? source)
+        {
+            if (source == null)
+                return "";
+            var type = source.GetType();
+            foreach (var property in new[] { "DisplayName", "Username" })
+            {
+                var found = type.GetProperty(property);
+                if (found == null || found.PropertyType != typeof(string))
+                    continue;
+                var value = found.GetValue(source, null) as string;
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value!.Trim();
+            }
+            return "";
         }
 
         public static string MirroredRoutesJson => mirroredRoutesJson;

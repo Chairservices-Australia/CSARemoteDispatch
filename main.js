@@ -974,13 +974,27 @@ function renderRoutes(routes) {
 
     const who = document.createElement('span');
     who.className = 'routeOperator';
-    who.textContent = route.requestedBy || 'Local';
+    // Falls back only when neither the page sign-in nor the Multiplayer mod
+    // had a name to give - a single player who never set one.
+    who.textContent = route.requestedBy || 'This machine';
     head.appendChild(who);
 
     const train = document.createElement('span');
     train.className = 'routeTrain';
     train.textContent = `train ${route.trainsetId}`;
     head.appendChild(train);
+
+    // Amending used to mean clearing the road and building the whole
+    // itinerary again from nothing. This loads the calls it has left back
+    // into the planner, so changing a platform is: edit, swap the call,
+    // Set route. Setting a road for a train replaces the one it has, so
+    // there is no clearing step and no moment with no road booked.
+    const edit = document.createElement('button');
+    edit.className = 'routeEdit';
+    edit.textContent = 'Edit';
+    edit.title = 'Load this road’s remaining calls into the planner';
+    edit.addEventListener('click', () => editRoute(route));
+    head.appendChild(edit);
 
     const clear = document.createElement('button');
     clear.className = 'routeClear';
@@ -1031,6 +1045,44 @@ function renderRoutes(routes) {
 
     routeList.appendChild(card);
   }
+}
+
+/// Put a booked road back on the workbench.
+///
+/// Only the calls it has still to make: the ones already behind it are not
+/// somewhere it needs sending again, and a road amended mid-journey should
+/// carry on from where the train actually is.
+function editRoute(route) {
+  const guid = guidForTrainset(route.trainsetId);
+  if (guid)
+    routeTrainSelect.value = guid;
+  // Leave the auto-selection alone from here, or riding in a train would drag
+  // the choice back the moment the next poll landed.
+  autoAppliedTrainGuid = autoDetectedTrainGuid;
+
+  const stops = Array.isArray(route.stops) ? route.stops : [];
+  const remaining = stops.slice(route.stopIndex || 0);
+  plannedStops = remaining.map(id => ({ id, label: stopLabelFor(id) }));
+  renderPlannedStops();
+  routeMessage.textContent = plannedStops.length > 0
+    ? `Editing road ${routeOrder(route)}. Change the calls, then press Set route.`
+    : 'That road has no calls left to change.';
+  if (!guid)
+    routeMessage.textContent += ' Its train is no longer listed - choose one.';
+}
+
+function guidForTrainset(trainsetId) {
+  // Prefer a locomotive, since that is how the train list names a consist.
+  let fallback = null;
+  for (const [carId, carData] of allCarData) {
+    if (carData.trainsetId !== trainsetId)
+      continue;
+    if (carId.startsWith('L-'))
+      return carData.guid;
+    if (!fallback)
+      fallback = carData.guid;
+  }
+  return fallback;
 }
 
 function refreshRoutes() {

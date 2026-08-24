@@ -784,7 +784,8 @@ body.theme-dark .followControl a.followControlButton.active svg {
   font-size: 11px;
 }
 
-.routeClear {
+.routeClear,
+.routeEdit {
   flex: 0 0 auto;
   padding: 2px 8px;
   font-size: 11px;

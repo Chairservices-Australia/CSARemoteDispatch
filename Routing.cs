@@ -545,6 +545,13 @@ namespace DvMod.RemoteDispatch
                 return route;
             }
 
+            // A train works one road at a time. Booking another used to leave
+            // both in the table competing for the same junctions - one reported
+            // as held short of its own train's other road - with the stale one
+            // rerouting every second as the train followed the other until it
+            // gave up. Setting a road for a train that has one replaces it.
+            ReplaceRoadsFor(trainset.id);
+
             PlanLeg(route, trainset, allowReversal);
             routes[route.id] = route;
             if (route.status != RouteStatus.Failed)
@@ -553,6 +560,19 @@ namespace DvMod.RemoteDispatch
                 Sessions.AddTag("routes");
             }
             return route;
+        }
+
+        /// Give up any road already booked for this train, junctions and signal
+        /// included, so the new one is not held short by the old.
+        private static void ReplaceRoadsFor(int trainsetId)
+        {
+            foreach (var existing in routes.Values.Where(r => r.trainsetId == trainsetId).ToList())
+            {
+                ReleaseAllocation(existing);
+                existing.status = RouteStatus.Cleared;
+                routes.Remove(existing.id);
+                Sessions.AddTag("routes");
+            }
         }
 
         /// Lay a road for the stop in hand into a route that already has its
@@ -1491,10 +1511,11 @@ namespace DvMod.RemoteDispatch
 
             route.status = route.pending.Count > 0 || route.waitingForSignal
                 ? RouteStatus.Pending : RouteStatus.Active;
-            var divergences = route.leftDivergences + route.rightDivergences > 0
-                ? " (" + route.leftDivergences + " left, " + route.rightDivergences + " right)"
-                : "";
-            var prefix = notice + (route.requiresReverse ? "Route set, train propels (cars lead). " : "");
+            // Only what the driver has to act on. Which way the road diverges,
+            // and that the train will propel, are on the route itself for a page
+            // to show however it likes; repeating them in prose on every road
+            // buried the messages that actually needed reading.
+            var prefix = notice;
             if (route.allocatedUpTo != int.MaxValue && !string.IsNullOrEmpty(route.heldShortOf))
             {
                 // Set as far as it can go. The train runs up to the signal
@@ -1508,13 +1529,16 @@ namespace DvMod.RemoteDispatch
                         + ". It will be extended when that route clears.");
                 return;
             }
+            // Nothing to say when the road is simply set. The status already
+            // reads Active and the card already names where the train is going,
+            // so a line restating it on every road is noise that buries the
+            // ones a driver has to act on. Notices - rerouted, which call this
+            // is - still speak, and so does anything holding the road up.
             route.message = route.waitingForSignal
                 ? prefix + "Waiting for the protecting signal route to clear."
                 : route.pending.Count > 0
                 ? prefix + "Waiting for " + route.pending.Count + " occupied junction(s) to clear."
-                : notice + (route.requiresReverse
-                    ? "Route set" + divergences + " - train propels, cars lead."
-                    : "Route set" + divergences + ".");
+                : notice;
         }
 
         /// Advance a route past track the train has already run over, so the

@@ -306,7 +306,11 @@ namespace DvMod.RemoteDispatch
                         return null;
                     }
                     var route = Routing.SetRoute(trainset, stops);
-                    route.requestedBy = context.User.Identity.Name ?? "";
+                    // Whoever signed in to the page, or failing that the name
+                    // the Multiplayer mod knows this player by - so a road shows
+                    // who set it rather than only that it was set here.
+                    var who = context.User.Identity.Name ?? "";
+                    route.requestedBy = who.Length > 0 ? who : RouteNetwork.LocalPlayerName();
                     return Routing.ToJson(route);
                 }).ConfigureAwait(false);
 
