@@ -111,27 +111,31 @@ namespace DvMod.RemoteDispatch
                 new JProperty("tracks", new JArray(TrackIdsOf(tracks))));
         }
 
-        /// Yard centre: the mean of the points defining the station's tracks.
+        /// Yard centre: the mean of every sampled point on the station's tracks.
         /// Preferred over the station office transform, which sits off to one
         /// side of larger yards and would drag the label away from the track.
         ///
-        /// Read straight off each curve rather than from a resampled point set.
-        /// Resampling every track of every yard is by far the most expensive
-        /// part of building this list, and it buys nothing here: what comes out
-        /// is one rough centre for a label, which the curve's own points give
-        /// to well within the size of the yard.
+        /// Taken from the resampled point set, which carries absolute world
+        /// coordinates, and not from the curve's own points, which come off
+        /// Transforms and therefore move with the floating origin. Everything
+        /// this mod puts on the map is absolute - the track geometry from this
+        /// same source, junctions and cars by subtracting WorldMover.currentMove
+        /// - so reading the Transforms put every label out by however far the
+        /// world had shifted, kilometres once the player had travelled.
+        ///
+        /// It also has to be absolute to be cached at all: a position worked out
+        /// against the current shift would be wrong the moment the player moved
+        /// away from where it was built.
         private static World.Position? CenterOf(IEnumerable<RailTrack> tracks)
         {
             double x = 0, z = 0;
             var count = 0;
             foreach (var track in tracks)
             {
-                var curve = track == null ? null : track.curve;
-                if (curve == null)
+                if (track == null)
                     continue;
-                for (var i = 0; i < curve.pointCount; i++)
+                foreach (var point in RailTracks.GetTrackPoints(track))
                 {
-                    var point = curve[i].position;
                     x += point.x;
                     z += point.z;
                     count++;
